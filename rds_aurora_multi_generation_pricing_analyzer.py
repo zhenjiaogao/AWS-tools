@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 """
-todo：
-1. diff 成本，并且将 diff 后值显示在 primary 节点
-2. 再次看下 gp3，io1 的iops 以及 throughput 的单价
 
-RDS MySQL和Aurora MySQL定价分析工具 - TAZ支持版本（r7g/r8g专版）
 支持获取指定区域的RDS MySQL实例信息，并计算RDS和Aurora的RI定价
 Aurora转换支持r7g、r8g两种实例类型，分别计算实例成本、存储成本和总MRR成本
-RDS替换支持r7g、r8g两种实例类型，分别计算实例成本、存储成本和总MRR成本
-新增存储信息获取功能：磁盘类型、容量、IOPS、带宽、使用量和存储成本计算
+RDS替换支持m7g、m8g、r7g、r8g四种实例类型，分别计算实例成本、存储成本和总MRR成本
 
-新增TAZ（三可用区数据库集群部署）支持：
-1. 通过DBClusterIdentifier识别Aurora集群
-2. 通过describe-db-clusters API识别Primary节点
-3. 在Aurora转换成本计算时，将存储成本分配到Primary节点
-4. 支持单实例、MAZ和TAZ三种架构的处理
-5. 分别计算Aurora实例MRR、存储MRR和总MRR成本
-
-新增RDS替换机型成本计算：
-1. 支持r7g、r8g两种RDS替换实例类型
-2. 计算RDS替换实例MRR、存储MRR和总MRR成本
-3. Multi-AZ架构下，实例和存储单价及MRR都乘以2
-4. 保持现有Aurora转换逻辑不变
+支持的实例类型：
+1. M系列实例：迁移Graviton3/4时使用m7g、m8g，迁移Aurora时使用r7g、r8g
+2. R系列实例：迁移Graviton3/4时使用r7g、r8g，迁移Aurora时使用r7g、r8g
+3. C系列实例：迁移Graviton3/4时使用m7g、m8g，迁移Aurora时使用r7g、r8g
 
 Multi-AZ存储成本优化：
 1. 当RDS MySQL是Multi-AZ架构时，迁移到Aurora时，存储成本不乘以2，仅算一份
@@ -53,6 +40,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+import pandas as pd
 
 
 class RDSAuroraMultiGenerationPricingAnalyzer:
@@ -266,6 +254,115 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             self.logger.warning(f"从CloudWatch获取实例 {db_instance_identifier} 存储使用量失败: {e}")
             return 'unknown'
 
+    def get_cloudwatch_metrics(self, db_instance_identifier: str) -> Dict:
+        """
+        获取RDS MySQL实例的CloudWatch指标（15天，1小时粒度）
+        包括IOPS平均值和CPU利用率的最大、最小、平均值
+        
+        Args:
+            db_instance_identifier: 数据库实例标识符
+            
+        Returns:
+            包含CloudWatch指标的字典
+        """
+        metrics = {
+            'iops_avg_15d': 'N/A',
+            'cpu_max_15d': 'N/A',
+            'cpu_min_15d': 'N/A',
+            'cpu_avg_15d': 'N/A'
+        }
+        
+        try:
+            # 15天前到现在的时间范围
+            end_time = time.time()
+            start_time = end_time - (15 * 24 * 3600)  # 15天前
+            
+            # 获取IOPS指标（ReadIOPS + WriteIOPS）
+            try:
+                read_iops_response = self.cloudwatch_client.get_metric_statistics(
+                    Namespace='AWS/RDS',
+                    MetricName='ReadIOPS',
+                    Dimensions=[
+                        {
+                            'Name': 'DBInstanceIdentifier',
+                            'Value': db_instance_identifier
+                        }
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,  # 1小时粒度
+                    Statistics=['Average']
+                )
+                
+                write_iops_response = self.cloudwatch_client.get_metric_statistics(
+                    Namespace='AWS/RDS',
+                    MetricName='WriteIOPS',
+                    Dimensions=[
+                        {
+                            'Name': 'DBInstanceIdentifier',
+                            'Value': db_instance_identifier
+                        }
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Average']
+                )
+                
+                # 计算总IOPS平均值
+                if read_iops_response['Datapoints'] and write_iops_response['Datapoints']:
+                    read_iops_values = [dp['Average'] for dp in read_iops_response['Datapoints']]
+                    write_iops_values = [dp['Average'] for dp in write_iops_response['Datapoints']]
+                    
+                    # 按时间戳对齐数据点
+                    read_dict = {dp['Timestamp']: dp['Average'] for dp in read_iops_response['Datapoints']}
+                    write_dict = {dp['Timestamp']: dp['Average'] for dp in write_iops_response['Datapoints']}
+                    
+                    total_iops_values = []
+                    for timestamp in read_dict:
+                        if timestamp in write_dict:
+                            total_iops_values.append(read_dict[timestamp] + write_dict[timestamp])
+                    
+                    if total_iops_values:
+                        metrics['iops_avg_15d'] = round(sum(total_iops_values) / len(total_iops_values), 2)
+                        
+            except Exception as e:
+                self.logger.warning(f"获取实例 {db_instance_identifier} IOPS指标失败: {e}")
+            
+            # 获取CPU利用率指标
+            try:
+                cpu_response = self.cloudwatch_client.get_metric_statistics(
+                    Namespace='AWS/RDS',
+                    MetricName='CPUUtilization',
+                    Dimensions=[
+                        {
+                            'Name': 'DBInstanceIdentifier',
+                            'Value': db_instance_identifier
+                        }
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Maximum', 'Minimum', 'Average']
+                )
+                
+                if cpu_response['Datapoints']:
+                    max_values = [dp['Maximum'] for dp in cpu_response['Datapoints']]
+                    min_values = [dp['Minimum'] for dp in cpu_response['Datapoints']]
+                    avg_values = [dp['Average'] for dp in cpu_response['Datapoints']]
+                    
+                    metrics['cpu_max_15d'] = round(max(max_values), 2)
+                    metrics['cpu_min_15d'] = round(min(min_values), 2)
+                    metrics['cpu_avg_15d'] = round(sum(avg_values) / len(avg_values), 2)
+                    
+            except Exception as e:
+                self.logger.warning(f"获取实例 {db_instance_identifier} CPU指标失败: {e}")
+                
+        except Exception as e:
+            self.logger.warning(f"获取实例 {db_instance_identifier} CloudWatch指标失败: {e}")
+        
+        return metrics
+
     def get_all_storage_pricing(self) -> None:
         """
         一次性获取该region下RDS MySQL Single-AZ的所有磁盘类型的存储单价、IOPS单价以及bandwidth单价，并进行缓存
@@ -367,70 +464,90 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
     def _get_iops_pricing_for_provisioned_storage(self) -> None:
         """
         专门获取io1和io2存储类型的IOPS定价
-        使用Provisioned IOPS产品族来获取IOPS定价
+        使用Provisioned IOPS产品族来获取IOPS定价，优先获取MySQL专用定价
         """
-        self.logger.info("开始获取io1和io2的IOPS定价...")
+        self.logger.info("开始获取io1和io2的MySQL IOPS定价...")
         
-        # IOPS类型映射
-        iops_type_mapping = {
-            'io1': 'Provisioned IOPS',
-            'io2': 'Provisioned IOPS-IO2'
-        }
+        mysql_results = {}
+        general_results = {}
         
-        for storage_type, volume_type in iops_type_mapping.items():
-            try:
-                # 构建IOPS定价查询过滤器
-                filters = [
-                    {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
+        try:
+            # 使用分页器获取所有Provisioned IOPS产品
+            paginator = self.pricing_client.get_paginator('get_products')
+            for page in paginator.paginate(
+                ServiceCode='AmazonRDS',
+                Filters=[
                     {'Type': 'TERM_MATCH', 'Field': 'productFamily', 'Value': 'Provisioned IOPS'},
-                    {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'MySQL'},
-                    {'Type': 'TERM_MATCH', 'Field': 'deploymentOption', 'Value': 'Single-AZ'},
-                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()},
-                    {'Type': 'TERM_MATCH', 'Field': 'volumeType', 'Value': volume_type}
+                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
                 ]
-                
-                response = self.pricing_client.get_products(
-                    ServiceCode='AmazonRDS',
-                    Filters=filters,
-                    FormatVersion='aws_v1',
-                    MaxResults=100
-                )
-                
-                # 解析IOPS定价
-                for price_item in response['PriceList']:
-                    product = json.loads(price_item)
+            ):
+                for product_str in page['PriceList']:
+                    product = json.loads(product_str)
+                    attrs = product['product']['attributes']
                     
-                    # 获取按需定价
-                    terms = product.get('terms', {})
-                    on_demand_terms = terms.get('OnDemand', {})
+                    usage_type = attrs.get('usagetype', '')
                     
-                    for term_key, term_data in on_demand_terms.items():
-                        price_dimensions = term_data.get('priceDimensions', {})
-                        for price_key, price_data in price_dimensions.items():
-                            price_per_unit = price_data.get('pricePerUnit', {})
-                            usd_price = price_per_unit.get('USD')
+                    # 跳过Multi-AZ和Mirror类型，确保Single-AZ
+                    if 'Multi-AZ' in usage_type or 'Mirror' in usage_type:
+                        continue
+                    
+                    terms = product.get('terms', {}).get('OnDemand', {})
+                    for term_data in terms.values():
+                        for price_data in term_data.get('priceDimensions', {}).values():
                             unit = price_data.get('unit', '')
+                            desc = price_data.get('description', '')
                             
-                            if usd_price and float(usd_price) > 0 and 'IOPS-Mo' in unit:
-                                price_value = float(usd_price)
+                            if 'IOPS' not in unit:
+                                continue
                                 
-                                # 确保存储类型已初始化
-                                if storage_type not in self.storage_pricing_cache:
-                                    self.storage_pricing_cache[storage_type] = {
-                                        'storage_price_per_gb_month': 0,
-                                        'iops_price_per_iops_month': 0,
-                                        'throughput_price_per_mbps_month': 0
-                                    }
+                            price_per_unit = price_data.get('pricePerUnit', {})
+                            if 'USD' not in price_per_unit:
+                                continue
                                 
-                                self.storage_pricing_cache[storage_type]['iops_price_per_iops_month'] = price_value
-                                self.logger.info(f"获取到 {storage_type} IOPS定价: ${price_value}/IOPS/月")
-                                break
-                        else:
-                            continue
-                        break
+                            price = float(price_per_unit['USD'])
+                            
+                            # 确定存储类型
+                            if 'io1' in desc.lower():
+                                storage_type = 'io1'
+                            elif 'io2' in desc.lower():
+                                storage_type = 'io2'
+                            else:
+                                continue
+                            
+                            # 检查是否为MySQL专用定价
+                            if 'MySQL' in desc:
+                                if storage_type not in mysql_results or price < mysql_results[storage_type]:
+                                    mysql_results[storage_type] = price
+                                    self.logger.info(f"MySQL专用IOPS定价: {storage_type} ${price}")
+                            
+                            # 所有Single-AZ IOPS定价都记录为通用定价
+                            if storage_type not in general_results or price < general_results[storage_type]:
+                                general_results[storage_type] = price
+            
+            # 合并结果：优先使用MySQL专用定价，否则使用通用定价
+            for storage_type in ['io1', 'io2']:
+                final_price = None
                 
-            except Exception as e:
-                self.logger.error(f"获取 {storage_type} IOPS定价失败: {e}")
+                if storage_type in mysql_results:
+                    final_price = mysql_results[storage_type]
+                    self.logger.info(f"使用MySQL专用{storage_type} IOPS定价: ${final_price}/IOPS/月")
+                elif storage_type in general_results:
+                    final_price = general_results[storage_type]
+                    self.logger.info(f"使用通用{storage_type} IOPS定价: ${final_price}/IOPS/月")
+                
+                if final_price:
+                    # 确保存储类型已初始化
+                    if storage_type not in self.storage_pricing_cache:
+                        self.storage_pricing_cache[storage_type] = {
+                            'storage_price_per_gb_month': 0,
+                            'iops_price_per_iops_month': 0,
+                            'throughput_price_per_mbps_month': 0
+                        }
+                    
+                    self.storage_pricing_cache[storage_type]['iops_price_per_iops_month'] = final_price
+                
+        except Exception as e:
+            self.logger.error(f"获取MySQL IOPS定价失败: {e}")
 
     def get_storage_pricing(self, storage_type: str) -> Dict:
         """
@@ -461,7 +578,8 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
 
     def get_aurora_storage_pricing(self) -> Dict:
         """
-        一次性获取某个region下Aurora存储的单价并缓存
+        获取Aurora MySQL的存储和IO请求单价
+        使用实时API获取准确的IO定价
         
         Returns:
             包含Aurora存储定价信息的字典
@@ -478,56 +596,90 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         }
         
         try:
-            # 构建Aurora存储定价查询过滤器
-            filters = [
+            # 获取Aurora存储单价
+            storage_filters = [
                 {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
                 {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()},
                 {'Type': 'TERM_MATCH', 'Field': 'productFamily', 'Value': 'Database Storage'},
                 {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'}
             ]
             
-            # 使用分页获取所有Aurora存储产品
-            paginator = self.pricing_client.get_paginator('get_products')
-            page_iterator = paginator.paginate(
+            storage_response = self.pricing_client.get_products(
                 ServiceCode='AmazonRDS',
-                Filters=filters
+                Filters=storage_filters,
+                MaxResults=1
             )
             
-            processed_count = 0
-            for page in page_iterator:
-                for price_item in page['PriceList']:
-                    product = json.loads(price_item)
-                    attributes = product.get('product', {}).get('attributes', {})
+            if storage_response['PriceList']:
+                product = json.loads(storage_response['PriceList'][0])
+                terms = product.get('terms', {}).get('OnDemand', {})
+                
+                for term_data in terms.values():
+                    for price_data in term_data.get('priceDimensions', {}).values():
+                        usd_price = price_data.get('pricePerUnit', {}).get('USD')
+                        if usd_price and 'GB-Mo' in price_data.get('unit', ''):
+                            pricing_info['storage_price_per_gb_month'] = round(float(usd_price)/2.25,3)
+                            self.logger.info(f"Aurora存储单价: ${round(float(usd_price)/2.25,3)}/GB/月")
+                            break
+                    else:
+                        continue
+                    break
+            
+            # 获取Aurora IO请求单价 - 使用实时API
+            self.logger.info("通过API获取Aurora IO定价...")
+            
+            # 使用分页器获取Aurora产品
+            paginator = self.pricing_client.get_paginator('get_products')
+            
+            for page in paginator.paginate(
+                ServiceCode='AmazonRDS',
+                Filters=[
+                    {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'},
+                    {'Type': 'TERM_MATCH', 'Field': 'regionCode', 'Value': self.region}
+                ]
+            ):
+                for product_str in page['PriceList']:
+                    product = json.loads(product_str)
                     
-                    # 获取按需定价
-                    terms = product.get('terms', {})
-                    on_demand_terms = terms.get('OnDemand', {})
-                    
-                    for term_key, term_data in on_demand_terms.items():
-                        price_dimensions = term_data.get('priceDimensions', {})
-                        for price_key, price_data in price_dimensions.items():
-                            price_per_unit = price_data.get('pricePerUnit', {})
-                            usd_price = price_per_unit.get('USD')
+                    # 获取定价信息
+                    terms = product.get('terms', {}).get('OnDemand', {})
+                    for term_data in terms.values():
+                        for price_data in term_data.get('priceDimensions', {}).values():
                             unit = price_data.get('unit', '')
-                            description = price_data.get('description', '')
                             
-                            if usd_price and float(usd_price) > 0:
-                                price_value = float(usd_price)
-                                processed_count += 1
+                            # 查找IO单位的定价
+                            if unit == 'IOs':
+                                price_per_unit = price_data.get('pricePerUnit', {})
+                                price_per_io = price_per_unit.get('USD', '0')
                                 
-                                # 根据单位和描述确定价格类型
-                                if 'GB-Mo' in unit and 'storage' in description.lower():
-                                    pricing_info['storage_price_per_gb_month'] = price_value
-                                    self.logger.info(f"Aurora存储单价: ${price_value}/GB/月")
-                                elif 'million' in unit.lower() and ('io' in description.lower() or 'request' in description.lower()):
-                                    pricing_info['io_request_price_per_million'] = price_value
-                                    self.logger.info(f"Aurora IO请求单价: ${price_value}/百万次请求")
+                                if float(price_per_io) > 0:
+                                    price_per_million = float(price_per_io) * 1000000
+                                    pricing_info['io_request_price_per_million'] = price_per_million
+                                    self.logger.info(f"Aurora IO请求单价: ${price_per_million}/百万次请求")
+                                    break
+                        else:
+                            continue
+                        break
+                    if pricing_info['io_request_price_per_million'] > 0:
+                        break
+                if pricing_info['io_request_price_per_million'] > 0:
+                    break
+            
+            # 如果API未获取到IO定价，设置为0并记录错误
+            if pricing_info['io_request_price_per_million'] == 0:
+                self.logger.error(f"未获取到Aurora IO定价")
             
             self.aurora_storage_pricing_cache = pricing_info
-            self.logger.info(f"Aurora存储定价缓存完成，共处理 {processed_count} 个定价项")
+            self.logger.info(f"Aurora存储定价获取完成")
             
         except Exception as e:
             self.logger.error(f"获取Aurora存储定价失败: {e}")
+            # 不使用默认值，直接返回0
+            pricing_info = {
+                'storage_price_per_gb_month': 0,
+                'io_request_price_per_million': 0
+            }
+            self.aurora_storage_pricing_cache = pricing_info
         
         return pricing_info
     def calculate_storage_cost(self, storage_info: Dict, storage_pricing: Dict, is_multi_az: bool = False, is_aurora_migration: bool = False) -> Dict:
@@ -631,7 +783,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
     def get_all_rds_mysql_instances(self) -> List[Dict]:
         """
         获取指定区域下所有RDS MySQL实例的基本信息和存储信息
-        仅处理db.m和db.r开头的实例类型，跳过db.t开头的实例
+        仅处理db.m、db.r和db.c开头的实例类型，跳过db.t开头的实例
         支持TAZ架构识别
         
         Returns:
@@ -709,7 +861,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                         'is_cluster_primary': cluster_info.get('is_primary', True),
                         'cluster_role': cluster_info.get('role', 'standalone'),
                         
-                        # 添加存储信息
+                        # 存储信息
                         'storage_type': storage_info['storage_type'],
                         'allocated_storage_gb': storage_info['allocated_storage_gb'],
                         'max_allocated_storage_gb': storage_info['max_allocated_storage_gb'],
@@ -836,10 +988,10 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
     def _should_process_instance(self, instance_class: str) -> bool:
         """
         判断是否应该处理该实例类型
-        仅处理db.m和db.r开头的实例，跳过db.t开头的实例
+        仅处理db.m、db.r和db.c开头的实例，跳过db.t开头的实例
         
         Args:
-            instance_class: 实例类型，如 'db.t3.micro', 'db.m6g.large', 'db.r5.xlarge'
+            instance_class: 实例类型，如 'db.t3.micro', 'db.m6g.large', 'db.r5.xlarge', 'db.c5.xlarge'
             
         Returns:
             True表示应该处理，False表示跳过
@@ -847,11 +999,11 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         if not instance_class.startswith('db.'):
             return False
         
-        # 提取实例族（如 't3', 'm6g', 'r5'）
+        # 提取实例族（如 't3', 'm6g', 'r5', 'c5'）
         instance_family = instance_class.split('.')[1] if len(instance_class.split('.')) > 1 else ''
         
-        # 仅处理m和r开头的实例族
-        if instance_family.startswith('m') or instance_family.startswith('r'):
+        # 处理m、r和c开头的实例族
+        if instance_family.startswith('m') or instance_family.startswith('r') or instance_family.startswith('c'):
             return True
         elif instance_family.startswith('t'):
             return False
@@ -899,7 +1051,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     if not instance_type:
                         continue
                     
-                    # 只处理db.m和db.r开头的实例类型
+                    # 只处理db.m、db.r和db.c开头的实例类型
                     if not self._should_process_instance(instance_type):
                         continue
                     
@@ -963,9 +1115,10 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         """
         将RDS实例类型映射到指定代的Aurora实例类型
         支持r6g、r7g、r8g三种Aurora实例类型
+        所有实例类型（M、R、C系列）迁移到Aurora时都使用R系列实例
         
         Args:
-            rds_instance_class: RDS实例类型，如 'db.m6g.2xlarge', 'db.r5.xlarge'
+            rds_instance_class: RDS实例类型，如 'db.m6g.2xlarge', 'db.r5.xlarge', 'db.c5.xlarge'
             aurora_generation: Aurora实例代数，如 'r6g', 'r7g', 'r8g'
             
         Returns:
@@ -977,17 +1130,17 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         # 提取大小部分（如 '2xlarge'）
         parts = instance_type.split('.')
         if len(parts) >= 2:
-            instance_family = parts[0]  # 如 'm6g', 'r5'
+            instance_family = parts[0]  # 如 'm6g', 'r5', 'c5'
             size = parts[1]             # 如 'xlarge', '2xlarge'
             
-            # 验证实例族是否为m或r开头
-            if not (instance_family.startswith('m') or instance_family.startswith('r')):
+            # 验证实例族是否为m、r或c开头
+            if not (instance_family.startswith('m') or instance_family.startswith('r') or instance_family.startswith('c')):
                 self.logger.warning(f"不支持的实例族类型 {instance_family}，使用默认值")
                 return f"db.{aurora_generation}.large"
             
-            # 映射到指定代的Aurora实例
+            # 所有实例类型迁移到Aurora时都映射到指定代的R系列实例
             aurora_instance_class = f"db.{aurora_generation}.{size}"
-            self.logger.debug(f"映射 {rds_instance_class} -> {aurora_instance_class}")
+            self.logger.debug(f"映射 {rds_instance_class} -> {aurora_instance_class} (Aurora迁移统一使用R系列)")
             return aurora_instance_class
         else:
             # 如果无法解析，默认返回指定代的large实例
@@ -998,10 +1151,10 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         """
         将RDS实例类型映射到指定代的RDS替换实例类型
         支持m7g、m8g、r7g、r8g四种RDS替换实例类型
-        M系列实例映射到m7g、m8g，R系列实例映射到r7g、r8g
+        M系列实例映射到m7g、m8g，R系列实例映射到r7g、r8g，C系列实例映射到m7g、m8g
         
         Args:
-            rds_instance_class: 原RDS实例类型，如 'db.m6g.2xlarge', 'db.r5.xlarge'
+            rds_instance_class: 原RDS实例类型，如 'db.m6g.2xlarge', 'db.r5.xlarge', 'db.c5.xlarge'
             replacement_generation: RDS替换实例代数，如 'm7g', 'm8g', 'r7g', 'r8g'
             
         Returns:
@@ -1013,7 +1166,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         # 提取大小部分（如 '2xlarge'）
         parts = instance_type.split('.')
         if len(parts) >= 2:
-            instance_family = parts[0]  # 如 'm6g', 'r5'
+            instance_family = parts[0]  # 如 'm6g', 'r5', 'c5'
             size = parts[1]             # 如 'xlarge', '2xlarge'
             
             # 判断原实例族类型
@@ -1036,6 +1189,16 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 else:
                     # 如果传入的是m7g或m8g，对于R系列实例返回None或跳过
                     self.logger.warning(f"R系列实例 {rds_instance_class} 不能映射到 {replacement_generation}")
+                    return None
+            elif instance_family.startswith('c'):
+                # C系列实例，映射到m7g或m8g（Graviton3/4迁移）
+                if replacement_generation in ['m7g', 'm8g']:
+                    rds_replacement_instance_class = f"db.{replacement_generation}.{size}"
+                    self.logger.debug(f"C系列RDS替换映射 {rds_instance_class} -> {rds_replacement_instance_class}")
+                    return rds_replacement_instance_class
+                else:
+                    # 如果传入的是r7g或r8g，对于C系列实例返回None或跳过
+                    self.logger.warning(f"C系列实例 {rds_instance_class} 不能映射到 {replacement_generation}")
                     return None
             else:
                 self.logger.warning(f"不支持的实例族类型 {instance_family}，跳过映射")
@@ -1186,7 +1349,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     if not instance_type:
                         continue
                     
-                    # 只处理db.m和db.r开头的实例类型
+                    # 只处理db.m、db.r和db.c开头的实例类型
                     if not self._should_process_instance(instance_type):
                         continue
                     
@@ -1421,8 +1584,8 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 if is_primary:
                     aurora_storage_cost_fields = {
                         'aurora_allocate_storage_gb': cluster_aurora_cost.get('aurora_storage_gb', 0),
-                        'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0),
-                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                        'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)
                     }
                     self.logger.info(f"RDS MySQL集群Primary节点 {instance['db_instance_identifier']} 承担存储成本: "
                                    f"${cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)}")
@@ -1430,8 +1593,8 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     # Read replica节点：Aurora存储成本填0
                     aurora_storage_cost_fields = {
                         'aurora_allocate_storage_gb': 0,
-                        'aurora_total_storage_cost_per_month_usd': 0,
-                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                        'aurora_total_storage_cost_per_month_usd': 0
                     }
                     self.logger.info(f"RDS MySQL集群Read Replica节点 {instance['db_instance_identifier']} 不承担存储成本")
             elif instance['architecture'] == 'taz_cluster':
@@ -1439,8 +1602,8 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 if instance.get('is_cluster_primary', False):
                     aurora_storage_cost_fields = {
                         'aurora_allocate_storage_gb': cluster_aurora_cost.get('aurora_storage_gb', 0),
-                        'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0),
-                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                        'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)
                     }
                     self.logger.info(f"TAZ集群Primary节点 {instance['db_instance_identifier']} 承担存储成本: "
                                    f"${cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)}")
@@ -1448,23 +1611,23 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     # Reader节点：Aurora存储成本填0
                     aurora_storage_cost_fields = {
                         'aurora_allocate_storage_gb': 0,
-                        'aurora_total_storage_cost_per_month_usd': 0,
-                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                        'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                        'aurora_total_storage_cost_per_month_usd': 0  
                     }
                     self.logger.info(f"TAZ集群Reader节点 {instance['db_instance_identifier']} 不承担存储成本")
             elif is_primary:
                 # 其他架构的主实例：显示完整的Aurora存储成本
                 aurora_storage_cost_fields = {
                     'aurora_allocate_storage_gb': cluster_aurora_cost.get('aurora_storage_gb', 0),
-                    'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0),
-                    'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                    'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                    'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)
                 }
             else:
                 # Read replica：Aurora存储成本填0
                 aurora_storage_cost_fields = {
                     'aurora_allocate_storage_gb': 0,
-                    'aurora_total_storage_cost_per_month_usd': 0,
-                    'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0)
+                    'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
+                    'aurora_total_storage_cost_per_month_usd': 0
                 }
             
             # 计算RDS总MRR（实例MRR + 存储MRR）
@@ -1480,22 +1643,25 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 self.logger.warning(f"实例 {instance['db_instance_identifier']} 无法计算RDS总MRR，"
                                   f"实例MRR={rds_mrr}, 存储MRR={total_storage_cost}")
             
+            # 获取CloudWatch指标
+            self.logger.info(f"获取实例 {instance['db_instance_identifier']} 的CloudWatch指标...")
+            cloudwatch_metrics = self.get_cloudwatch_metrics(instance['db_instance_identifier'])
+            
             # 构建基础结果
             result = {
                 'account_id': instance['account_id'],
                 'region': instance['region'],
+                # 集群信息
+                'cluster_id': cluster_id,
+                #'cluster_role': instance.get('cluster_role', 'standalone'),
+                #'is_cluster_primary': instance.get('is_cluster_primary', True),
                 'mysql_engine_version': instance['mysql_engine_version'],
                 'db_instance_identifier': instance['db_instance_identifier'],
                 'source_db_instance_identifier': instance['source_db_instance_identifier'],
                 'architecture': instance['architecture'],
                 'rds_instance_class': instance['instance_class'],
                 'rds_hourly_rate_usd': rds_adjusted_rate if rds_adjusted_rate else 'NA',
-                'rds_mrr_usd': rds_mrr,
-                
-                # 集群信息
-                #'cluster_identifier': cluster_id,
-                #'cluster_role': instance.get('cluster_role', 'standalone'),
-                #'is_cluster_primary': instance.get('is_cluster_primary', True),
+                'rds_instance_mrr_usd': rds_mrr,
                 
                 # 存储信息
                 'storage_type': storage_type,
@@ -1503,6 +1669,12 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 'used_storage_gb': instance['used_storage_gb'],
                 'iops': instance['iops'],
                 'storage_throughput_mbps': instance['storage_throughput_mbps'],
+                
+                # CloudWatch指标（15天，1小时粒度）
+                'iops-avg.1Hr/15-day period': cloudwatch_metrics['iops_avg_15d'],
+                'cpu-max.1Hr/15-day period': cloudwatch_metrics['cpu_max_15d'],
+                'cpu-min.1Hr/15-day period': cloudwatch_metrics['cpu_min_15d'],
+                'cpu-avg.1Hr/15-day period': cloudwatch_metrics['cpu_avg_15d'],
                 
                 # 存储定价
                 'storage_price_per_gb_month_usd': storage_pricing.get('storage_price_per_gb_month', 'NA'),
@@ -1537,22 +1709,46 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 aurora_hourly_rate = self.get_aurora_mysql_pricing_from_cache(aurora_instance_class)
                 
                 # 根据架构调整Aurora价格
-                #if instance['architecture'] in ['multi_az', 'taz_cluster'] and aurora_hourly_rate:
-                #    if instance['architecture'] == 'taz_cluster':
-                #        # TAZ集群：每个实例都按单价计算
-                #        aurora_adjusted_rate = aurora_hourly_rate
-                #        self.logger.info(f"实例 {instance['db_instance_identifier']} 是TAZ集群成员，Aurora {generation}使用单价")
-                #    else:
-                #        # Multi-AZ：价格乘以2
-                #        aurora_adjusted_rate = aurora_hourly_rate
-                #        print("#######")
-                #        print(aurora_adjusted_rate)
-                #        self.logger.info(f"实例 {instance['db_instance_identifier']} 是multi_az，Aurora {generation}使用单价")
-                #else:
-                aurora_adjusted_rate = aurora_hourly_rate
+                if instance['architecture'] in ['multi_az', 'taz_cluster'] and aurora_hourly_rate:
+                    if instance['architecture'] == 'taz_cluster':
+                        # TAZ集群：每个实例都按单价计算
+                        aurora_adjusted_rate = aurora_hourly_rate
+                        self.logger.info(f"实例 {instance['db_instance_identifier']} 是TAZ集群成员，Aurora {generation}使用单价")
+                    elif instance['architecture'] == 'multi_az':
+                        # Multi-AZ：检查是否有read replica
+                        has_read_replica = any(
+                            inst.get('source_db_instance_identifier') == instance['db_instance_identifier']
+                            for inst in instances
+                        )
+                        if has_read_replica:
+                            # MAZ + Read Replica：Aurora不乘以2
+                            aurora_adjusted_rate = aurora_hourly_rate
+                            self.logger.info(f"实例 {instance['db_instance_identifier']} 是MAZ+ReadReplica，Aurora {generation}不乘以2")
+                        else:
+                            # 仅MAZ：Aurora乘以2
+                            aurora_adjusted_rate = aurora_hourly_rate * 2
+                            self.logger.info(f"实例 {instance['db_instance_identifier']} 是仅MAZ，Aurora {generation}乘以2")
+                else:
+                    aurora_adjusted_rate = aurora_hourly_rate
                 
-                # 计算Aurora IO Optimized实例MRR（不包含存储）
-                aurora_instance_mrr = round(self.calculate_mrr(aurora_adjusted_rate*1.3), 2) if aurora_adjusted_rate else 'NA'
+                # 计算Aurora standard 实例MRR（不包含存储）
+                aurora_instance_mrr = round(self.calculate_mrr(aurora_adjusted_rate), 2) if aurora_adjusted_rate else 'NA'
+                
+                # 计算Aurora Standard的IO费用
+                aurora_io_cost_mrr = 0
+                rds_iops_avg = cloudwatch_metrics.get('iops_avg_15d', 0)
+                if isinstance(rds_iops_avg, (int, float)) and rds_iops_avg > 0:
+                    # 1. RDS MySQL 的每小时的 iops 乘以 730 得到一个月的 IO 总量
+                    monthly_io_total = rds_iops_avg * 730
+                    
+                    # 2. 基于一个月的 IO 总量，以及 aurora 每百万 io 的单价，计算出迁移至 aurora 后的 io 费用
+                    aurora_io_pricing = self.get_aurora_storage_pricing()
+                    io_price_per_million = aurora_io_pricing.get('io_request_price_per_million', 0)
+                    if io_price_per_million > 0:
+                        aurora_io_cost_mrr = (monthly_io_total / 1000000) * io_price_per_million
+                        self.logger.info(f"实例 {instance['db_instance_identifier']} Aurora {generation} IO费用计算: "
+                                       f"IOPS={rds_iops_avg}/小时, 月总IO={monthly_io_total:,.0f}, "
+                                       f"IO费用=${aurora_io_cost_mrr:.2f}/月")
                 
                 # 获取Aurora存储成本（支持RDS MySQL集群、TAZ架构和其他架构）
                 aurora_storage_mrr = 0
@@ -1583,20 +1779,24 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     self.logger.info(f"Primary节点 {instance['db_instance_identifier']} "
                                    f"Aurora {generation} 存储成本: ${aurora_storage_mrr}")
                 
-                # 计算总MRR（实例成本 + 存储成本）
+                # 计算总MRR（实例成本 + 存储成本 + IO成本）
                 if aurora_instance_mrr != 'NA':
-                    aurora_total_mrr = round(aurora_instance_mrr + aurora_storage_mrr, 2)
+                    aurora_standard_total_mrr = round(aurora_instance_mrr + aurora_storage_mrr + aurora_io_cost_mrr, 2)
+                    aurora_optimized_total_mrr = round(float(aurora_instance_mrr)*1.3 + float(aurora_storage_mrr)*2.25, 2)
                 else:
-                    aurora_total_mrr = 'NA'
+                    aurora_standard_total_mrr = 'NA'
+                    aurora_optimized_total_mrr = 'NA'
                 
                 # 添加到结果中
                 result[f'aurora_{generation}_instance_class'] = aurora_instance_class
-                result[f'aurora_{generation}_hourly_rate_usd'] = aurora_adjusted_rate*1.3 if aurora_adjusted_rate else 'NA'
-                result[f'aurora_{generation}_instance_mrr_usd'] = aurora_instance_mrr
-                result[f'aurora_{generation}_storage_mrr_usd'] = round(aurora_storage_mrr, 2) if aurora_storage_mrr > 0 else 0
-                result[f'aurora_{generation}_total_mrr_usd'] = aurora_total_mrr
+                result[f'aurora_{generation}_hourly_rate_usd'] = aurora_adjusted_rate if aurora_adjusted_rate else 'NA'
+                result[f'aurora_{generation}_standard_instance_mrr_usd'] = aurora_instance_mrr
+                result[f'aurora_{generation}_standard_io_cost_mrr_usd'] = round(aurora_io_cost_mrr, 2) if aurora_io_cost_mrr > 0 else 0
+                result[f'aurora_{generation}_standard_total_mrr_usd'] = aurora_standard_total_mrr
+                result[f'aurora_{generation}_optimized_instance_mrr_usd'] = float(aurora_instance_mrr) * 1.3 if aurora_instance_mrr not in ['NA', 'N/A', '', None] else 'NA'
+                result[f'aurora_{generation}_optimized_total_mrr_usd'] = aurora_optimized_total_mrr
             
-            # 确定原实例的系列类型（M系列或R系列）
+            # 确定原实例的系列类型（M系列、R系列或C系列）
             original_instance_type = instance['instance_class'].replace('db.', '')
             original_family = original_instance_type.split('.')[0] if '.' in original_instance_type else ''
             
@@ -1609,6 +1809,10 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 # R系列实例，计算r7g和r8g
                 applicable_generations = ['r7g', 'r8g']
                 series_type = 'R'
+            elif original_family.startswith('c'):
+                # C系列实例，迁移Graviton3/4时使用m7g和m8g
+                applicable_generations = ['m7g', 'm8g']
+                series_type = 'C'
             else:
                 # 其他系列，跳过RDS替换计算
                 applicable_generations = []
@@ -1676,19 +1880,19 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 # 生成单行格式的RDS替换结果
                 gen1, gen2 = applicable_generations[0], applicable_generations[1]
                 
-                result[f'rds_replacement_{series_type.lower()}_series_gen1'] = gen1
-                result[f'rds_replacement_{series_type.lower()}_series_gen1_instance_class'] = rds_replacement_results.get(gen1, {}).get('instance_class', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen1_hourly_rate_usd'] = rds_replacement_results.get(gen1, {}).get('hourly_rate', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen1_instance_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('instance_mrr', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen1_storage_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('storage_mrr', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen1_total_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('total_mrr', 'NA')
+                #result[f'rds_replacement_{gen1}_series'] = gen1
+                result[f'rds_replacement_{gen1}_instance_class'] = rds_replacement_results.get(gen1, {}).get('instance_class', 'NA')
+                result[f'rds_replacement_{gen1}_hourly_rate_usd'] = rds_replacement_results.get(gen1, {}).get('hourly_rate', 'NA')
+                result[f'rds_replacement_{gen1}_instance_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('instance_mrr', 'NA')
+                result[f'rds_replacement_{gen1}_storage_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('storage_mrr', 'NA')
+                result[f'rds_replacement_{gen1}_total_mrr_usd'] = rds_replacement_results.get(gen1, {}).get('total_mrr', 'NA')
                 
-                result[f'rds_replacement_{series_type.lower()}_series_gen2'] = gen2
-                result[f'rds_replacement_{series_type.lower()}_series_gen2_instance_class'] = rds_replacement_results.get(gen2, {}).get('instance_class', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen2_hourly_rate_usd'] = rds_replacement_results.get(gen2, {}).get('hourly_rate', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen2_instance_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('instance_mrr', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen2_storage_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('storage_mrr', 'NA')
-                result[f'rds_replacement_{series_type.lower()}_series_gen2_total_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('total_mrr', 'NA')
+                #result[f'rds_replacement_{gen2}_series'] = gen2
+                result[f'rds_replacement_{gen2}_instance_class'] = rds_replacement_results.get(gen2, {}).get('instance_class', 'NA')
+                result[f'rds_replacement_{gen2}_hourly_rate_usd'] = rds_replacement_results.get(gen2, {}).get('hourly_rate', 'NA')
+                result[f'rds_replacement_{gen2}_instance_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('instance_mrr', 'NA')
+                result[f'rds_replacement_{gen2}_storage_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('storage_mrr', 'NA')
+                result[f'rds_replacement_{gen2}_total_mrr_usd'] = rds_replacement_results.get(gen2, {}).get('total_mrr', 'NA')
             else:
                 # 如果不适用，填充NA值
                 result['rds_replacement_not_applicable'] = f"原实例系列 {original_family} 不支持RDS替换"
@@ -1916,6 +2120,128 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         
         return False
 
+    def generate_cluster_summary_by_series(self, results: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """
+        按实例系列生成集群汇总数据，分为M/C系列和R系列
+        
+        Args:
+            results: 详细分析结果列表
+            
+        Returns:
+            (M/C系列集群汇总, R系列集群汇总)
+        """
+        mc_clusters = {}
+        r_clusters = {}
+        
+        for result in results:
+            cluster_id = result.get('cluster_id', 'unknown')
+            rds_instance_class = result.get('rds_instance_class', '')
+            
+            # 判断实例系列
+            instance_family = rds_instance_class.replace('db.', '').split('.')[0] if rds_instance_class else ''
+            is_r_series = instance_family.startswith('r')
+            
+            # 选择对应的集群字典
+            target_clusters = r_clusters if is_r_series else mc_clusters
+            
+            if cluster_id not in target_clusters:
+                base_fields = {
+                    'account_id': result.get('account_id'),
+                    'region': result.get('region'),
+                    'cluster_id': cluster_id,
+                    'instance_count': 0,
+                    'rds_total_mrr_usd': 0,
+                    'aurora_r7g_standard_total_mrr_usd': 0,
+                    'aurora_r8g_standard_total_mrr_usd': 0,
+                    'aurora_r7g_optimized_total_mrr_usd': 0,
+                    'aurora_r8g_optimized_total_mrr_usd': 0
+                }
+                
+                # 根据系列添加相应的RDS替换字段
+                if is_r_series:
+                    base_fields.update({
+                        'rds_replacement_r7g_total_mrr_usd': 0,
+                        'rds_replacement_r8g_total_mrr_usd': 0
+                    })
+                else:
+                    base_fields.update({
+                        'rds_replacement_m7g_total_mrr_usd': 0,
+                        'rds_replacement_m8g_total_mrr_usd': 0
+                    })
+                
+                target_clusters[cluster_id] = base_fields
+            
+            summary = target_clusters[cluster_id]
+            summary['instance_count'] += 1
+            
+            # 汇总通用成本字段
+            common_fields = ['rds_total_mrr_usd', 'aurora_r7g_standard_total_mrr_usd', 'aurora_r8g_standard_total_mrr_usd',
+                           'aurora_r7g_optimized_total_mrr_usd', 'aurora_r8g_optimized_total_mrr_usd']
+            
+            # 根据系列添加相应的RDS替换字段
+            if is_r_series:
+                relevant_fields = common_fields + ['rds_replacement_r7g_total_mrr_usd', 'rds_replacement_r8g_total_mrr_usd']
+            else:
+                relevant_fields = common_fields + ['rds_replacement_m7g_total_mrr_usd', 'rds_replacement_m8g_total_mrr_usd']
+            
+            for field in relevant_fields:
+                value = result.get(field, 0)
+                if isinstance(value, (int, float)):
+                    summary[field] += value
+        
+        # 转换为列表并四舍五入
+        def process_summaries(cluster_dict):
+            summary_list = []
+            for summary in cluster_dict.values():
+                for key, value in summary.items():
+                    if key.endswith('_usd') and isinstance(value, (int, float)):
+                        summary[key] = round(value, 2)
+                summary_list.append(summary)
+            return summary_list
+        
+        return process_summaries(mc_clusters), process_summaries(r_clusters)
+
+    def export_to_excel(self, results: List[Dict], output_file: str):
+        """
+        将分析结果导出到Excel文件，包含详细数据和集群汇总两个sheet
+        
+        Args:
+            results: 分析结果列表
+            output_file: 输出文件路径
+        """
+        if not results:
+            self.logger.warning("没有数据可导出")
+            return
+        
+        try:
+            # 生成按系列分组的集群汇总数据
+            mc_summary, r_summary = self.generate_cluster_summary_by_series(results)
+            
+            # 创建Excel writer
+            excel_file = output_file.replace('.csv', '.xlsx')
+            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+                # 详细数据sheet
+                df_details = pd.DataFrame(results)
+                df_details.to_excel(writer, sheet_name='详细数据', index=False)
+                
+                # M/C系列集群汇总sheet
+                if mc_summary:
+                    df_mc_summary = pd.DataFrame(mc_summary)
+                    df_mc_summary.to_excel(writer, sheet_name='M_C系列集群汇总', index=False)
+                
+                # R系列集群汇总sheet
+                if r_summary:
+                    df_r_summary = pd.DataFrame(r_summary)
+                    df_r_summary.to_excel(writer, sheet_name='R系列集群汇总', index=False)
+            
+            self.logger.info(f"Excel结果已导出到: {excel_file}")
+            self.logger.info(f"包含 {len(results)} 条详细记录, {len(mc_summary)} 个M/C系列集群, {len(r_summary)} 个R系列集群")
+            
+        except Exception as e:
+            self.logger.error(f"导出Excel失败: {e}")
+            # 如果Excel导出失败，回退到CSV
+            self.export_to_csv(results, output_file)
+
     def export_to_csv(self, results: List[Dict], output_file: str):
         """
         将分析结果导出到CSV文件（包含存储信息和TAZ支持）
@@ -1933,13 +2259,14 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         base_fieldnames = [
             'account_id', 
             'region',
+            'cluster_id',
             'mysql_engine_version',
             'db_instance_identifier',
             'source_db_instance_identifier',
             'architecture',
             'rds_instance_class',
             'rds_hourly_rate_usd',
-            'rds_mrr_usd',
+            'rds_instance_mrr_usd',
             
             # 存储信息字段
             'storage_type',
@@ -1947,6 +2274,12 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             'used_storage_gb',
             'iops',
             'storage_throughput_mbps',
+            
+            # CloudWatch指标字段（15天，1小时粒度）
+            'iops-avg.1Hr/15-day period',
+            'cpu-max.1Hr/15-day period',
+            'cpu-min.1Hr/15-day period',
+            'cpu-avg.1Hr/15-day period',
             
             # 存储定价字段
             'storage_price_per_gb_month_usd',
@@ -1972,9 +2305,11 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             aurora_fieldnames.extend([
                 f'aurora_{generation}_instance_class',
                 f'aurora_{generation}_hourly_rate_usd',
-                f'aurora_{generation}_instance_mrr_usd',
-                f'aurora_{generation}_storage_mrr_usd',
-                f'aurora_{generation}_total_mrr_usd'
+                f'aurora_{generation}_standard_instance_mrr_usd',
+                f'aurora_{generation}_standard_io_cost_mrr_usd',
+                f'aurora_{generation}_standard_total_mrr_usd',
+                f'aurora_{generation}_optimized_instance_mrr_usd',
+                f'aurora_{generation}_optimized_total_mrr_usd'
             ])
         
         # 动态收集所有RDS替换字段名
@@ -2028,7 +2363,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='RDS MySQL和Aurora MySQL定价分析工具 - TAZ支持版本（r7g/r8g专版）')
+    parser = argparse.ArgumentParser(description='RDS MySQL和Aurora MySQL定价分析工具 - 支持M/R/C系列实例（r7g/r8g/m7g/m8g专版）')
     parser.add_argument('region', help='AWS区域名称 (如: us-east-1)')
     parser.add_argument('-o', '--output', default=None, 
                        help='输出CSV文件名 (默认: 自动生成包含区域和时间的文件名)')
@@ -2038,7 +2373,7 @@ def main():
     # 如果没有指定输出文件名，则自动生成
     if args.output is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-        args.output = f'rds_aurora_r7g_r8g_pricing_analysis_{args.region}_{timestamp}.csv'
+        args.output = f'rds_aurora_pricing_analysis_{args.region}_{timestamp}.csv'
     
     try:
         # 创建分析器
@@ -2046,8 +2381,12 @@ def main():
         
         # 执行分析
         print(f"开始分析区域 {args.region} 的RDS MySQL实例...")
+        print("支持M/R/C系列实例类型")
         print("将计算Aurora r7g、r8g两种实例类型的转换成本")
-        print("将计算RDS替换r7g、r8g两种实例类型的成本")
+        print("将计算RDS替换成本：")
+        print("  - M系列实例：m7g、m8g")
+        print("  - R系列实例：r7g、r8g") 
+        print("  - C系列实例：m7g、m8g（Graviton3/4迁移）")
         print("分别计算实例MRR、存储MRR和总MRR成本")
         print("包含存储类型、容量、IOPS、带宽和存储成本分析")
         print("支持TAZ（三可用区数据库集群部署）架构")
@@ -2055,8 +2394,8 @@ def main():
         
         if results:
             # 导出结果
-            analyzer.export_to_csv(results, args.output)
-            print(f"分析完成！共处理 {len(results)} 个实例，结果已保存到 {args.output}")
+            analyzer.export_to_excel(results, args.output)
+            print(f"分析完成！共处理 {len(results)} 个实例，结果已保存到 {args.output.replace('.csv', '.xlsx')}")
             print("RDS成本包含：")
             print("- 实例MRR：RDS实例的月度费用（不含存储）")
             print("- 存储MRR：RDS存储的月度费用")
@@ -2079,7 +2418,13 @@ def main():
             print("- Aurora存储成本基于Primary节点的实际使用量(used_storage_gb)计算")
             print("- 符合Aurora共享存储特性，不累加集群中所有节点的存储量")
             print("- Read Replica节点的Aurora存储成本为0，避免重复计算")
-            print("- 计算r7g和r8g两种实例类型的转换/替换成本")
+            print("- 计算r7g和r8g两种实例类型的Aurora转换成本")
+            print("- M系列实例：计算m7g、m8g的RDS替换成本")
+            print("- R系列实例：计算r7g、r8g的RDS替换成本")
+            print("- C系列实例：计算m7g、m8g的RDS替换成本（Graviton3/4迁移）")
+            print("实例迁移策略：")
+            print("- Aurora迁移：所有实例类型（M/R/C系列）统一迁移到r7g、r8g")
+            print("- Graviton迁移：M/C系列→m7g、m8g，R系列→r7g、r8g")
         else:
             print("未找到任何RDS MySQL实例")
             
