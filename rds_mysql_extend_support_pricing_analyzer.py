@@ -59,6 +59,10 @@ class RDSPricingAnalyzer:
                     product_location = attributes.get('location', '')
                     
                     if 'ExtendedSupport' in usage_type and product_location == location:
+                        # 只获取标准版Extended Support定价，过滤特殊后缀版本
+                        if ':PP' in usage_type or ':Gov' in usage_type or ':Spot' in usage_type:
+                            continue
+                        
                         # 获取定价
                         terms = product.get('terms', {}).get('OnDemand', {})
                         
@@ -259,13 +263,13 @@ class RDSPricingAnalyzer:
             'us-east-2': 'US East (Ohio)',
             'us-west-1': 'US West (N. California)',
             'us-west-2': 'US West (Oregon)',
-            'eu-west-1': 'Europe (Ireland)',
-            'eu-west-2': 'Europe (London)',
-            'eu-west-3': 'Europe (Paris)',
-            'eu-central-1': 'Europe (Frankfurt)',
+            'eu-west-1': 'EU (Ireland)',
+            'eu-west-2': 'EU (London)',
+            'eu-west-3': 'EU (Paris)',
+            'eu-central-1': 'EU (Frankfurt)',
             'eu-central-2': 'Europe (Zurich)',
-            'eu-north-1': 'Europe (Stockholm)',
-            'eu-south-1': 'Europe (Milan)',
+            'eu-north-1': 'EU (Stockholm)',
+            'eu-south-1': 'EU (Milan)',
             'eu-south-2': 'Europe (Spain)',
             'ap-southeast-1': 'Asia Pacific (Singapore)',
             'ap-southeast-2': 'Asia Pacific (Sydney)',
