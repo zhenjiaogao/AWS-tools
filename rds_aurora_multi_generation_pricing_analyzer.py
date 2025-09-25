@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-
 支持获取指定区域的RDS MySQL实例信息，并计算RDS和Aurora的RI定价
 Aurora转换支持r7g、r8g两种实例类型，分别计算实例成本、存储成本和总MRR成本
 RDS替换支持m7g、m8g、r7g、r8g四种实例类型，分别计算实例成本、存储成本和总MRR成本
@@ -74,81 +73,42 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         self.aurora_clusters_cache = {}
         
         # 设置日志
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self._setup_logging()
         self.logger = logging.getLogger(__name__)
 
-    def get_all_aurora_clusters(self) -> Dict[str, Dict]:
-        """
-        获取所有Aurora集群信息并缓存
+    def _setup_logging(self):
+        """设置日志配置：详细日志输出到文件，屏幕仅显示必要信息"""
+        # 生成日志文件名：region_时间戳.log
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"{self.region}_{timestamp}.log"
         
-        Returns:
-            集群信息字典，key为集群ID，value为集群详细信息
-        """
-        if self.aurora_clusters_cache:
-            self.logger.info("Aurora集群缓存已存在，跳过重复获取")
-            return self.aurora_clusters_cache
+        # 清除现有的日志配置
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
         
-        try:
-            self.logger.info("开始获取Aurora集群信息...")
-            paginator = self.rds_client.get_paginator('describe_db_clusters')
-            
-            for page in paginator.paginate():
-                for cluster in page['DBClusters']:
-                    # 只处理MySQL引擎的集群
-                    if cluster.get('Engine') in ['aurora-mysql', 'mysql']:
-                        cluster_id = cluster['DBClusterIdentifier']
-                        
-                        # 识别Primary节点
-                        primary_node = self._identify_cluster_primary_node(cluster)
-                        
-                        # 构建集群信息
-                        cluster_info = {
-                            'cluster_id': cluster_id,
-                            'engine': cluster.get('Engine'),
-                            'engine_version': cluster.get('EngineVersion'),
-                            'primary_node': primary_node,
-                            'members': cluster.get('DBClusterMembers', []),
-                            'multi_az': cluster.get('MultiAZ', False),
-                            'endpoint': cluster.get('Endpoint'),
-                            'reader_endpoint': cluster.get('ReaderEndpoint')
-                        }
-                        
-                        self.aurora_clusters_cache[cluster_id] = cluster_info
-                        
-                        self.logger.info(f"找到Aurora集群: {cluster_id}, Primary节点: {primary_node}, "
-                                       f"成员数: {len(cluster_info['members'])}")
-            
-            self.logger.info(f"共缓存 {len(self.aurora_clusters_cache)} 个Aurora MySQL集群")
-            return self.aurora_clusters_cache
-            
-        except Exception as e:
-            self.logger.error(f"获取Aurora集群失败: {e}")
-            return {}
+        # 创建文件处理器 - 详细日志
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        
+        # 创建控制台处理器 - 仅必要信息
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(message)s')
+        console_handler.setFormatter(console_formatter)
+        
+        # 配置根日志器
+        logging.root.setLevel(logging.DEBUG)
+        logging.root.addHandler(file_handler)
+        logging.root.addHandler(console_handler)
+        
+        print(f"详细日志将输出到文件: {log_filename}")
 
-    def _identify_cluster_primary_node(self, cluster_info: Dict) -> Optional[str]:
-        """
-        识别Aurora集群的Primary节点
-        
-        Args:
-            cluster_info: 集群信息字典
-            
-        Returns:
-            Primary节点的实例标识符，如果未找到返回None
-        """
-        try:
-            cluster_members = cluster_info.get('DBClusterMembers', [])
-            
-            for member in cluster_members:
-                if member.get('IsClusterWriter', False):
-                    primary_instance = member['DBInstanceIdentifier']
-                    return primary_instance
-            
-            self.logger.warning(f"集群 {cluster_info.get('DBClusterIdentifier')} 未找到Primary节点")
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"识别Primary节点失败: {e}")
-            return None
+    def _print_progress(self, message: str):
+        """输出进度信息到屏幕和日志文件"""
+        self.logger.info(message)
+
 
     def get_storage_info(self, db_instance_identifier: str, db_instance_data: Dict) -> Dict:
         """
@@ -793,8 +753,9 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         account_id = self.get_account_id()
         skipped_instances = []
         
-        # 首先获取Aurora集群信息
-        aurora_clusters = self.get_all_aurora_clusters()
+        # 首先获取Aurora集群信息 - 注销：RDS MySQL迁移不需要现有Aurora集群信息
+        # aurora_clusters = self.get_all_aurora_clusters()
+        aurora_clusters = {}
         
         try:
             paginator = self.rds_client.get_paginator('describe_db_instances')
@@ -808,7 +769,18 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
 
             # 然后处理每个实例
             for db_instance in all_db_instances:
+                # 跳过非available状态的实例
+                if db_instance.get('DBInstanceStatus') != 'available':
+                    self.logger.info(f"跳过实例 {db_instance['DBInstanceIdentifier']} (状态: {db_instance.get('DBInstanceStatus', 'unknown')})")
+                    continue
+                    
                 instance_class = db_instance['DBInstanceClass']
+                
+                # 获取引擎版本并进行过滤
+                engine_version = db_instance.get('EngineVersion', 'unknown')
+                if not engine_version.startswith('8.0'):
+                    self.logger.info(f"跳过实例 {db_instance['DBInstanceIdentifier']} (引擎版本: {engine_version}，仅处理8.0开头的版本)")
+                    continue
                 
                 # 过滤实例类型：仅处理db.m和db.r开头的实例
                 if self._should_process_instance(instance_class):
@@ -829,30 +801,51 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     
                     # 处理source_db_instance_identifier字段
                     source_db_identifier = db_instance.get('ReadReplicaSourceDBInstanceIdentifier', 'N/A')
+                    source_cluster_identifier = db_instance.get('ReadReplicaSourceDBClusterIdentifier', 'N/A')
                     
                     # 特殊处理TAZ架构下的read replica
-                    if architecture == 'taz_cluster' and not cluster_info.get('is_primary', True):
-                        # TAZ架构下的read replica，显示writer node的实际db_instance_identifier
-                        primary_node_id = cluster_info.get('primary_node_id')
-                        if primary_node_id:
-                            source_db_identifier = primary_node_id
-                            self.logger.info(f"TAZ集群Reader节点 {db_instance['DBInstanceIdentifier']} 的source_db_instance_identifier设置为Primary节点: {primary_node_id}")
-                        else:
-                            source_db_identifier = 'writer-node'
-                            self.logger.info(f"TAZ集群Reader节点 {db_instance['DBInstanceIdentifier']} 未找到Primary节点，使用默认值'writer-node'")
-                    elif architecture == 'read_replica':
-                        # 普通read replica，设置为"writer-node"
-                        source_db_identifier = 'writer-node'
-                        self.logger.info(f"Read replica实例 {db_instance['DBInstanceIdentifier']} 的source_db_instance_identifier设置为'writer-node'")
+                    if architecture == 'taz_cluster':
+                        # 通过API获取集群信息来确定writer节点
+                        rds_cluster_id = db_instance.get('DBClusterIdentifier')
+                        if rds_cluster_id:
+                            try:
+                                cluster_response = self.rds_client.describe_db_clusters(
+                                    DBClusterIdentifier=rds_cluster_id
+                                )
+                                if cluster_response['DBClusters']:
+                                    cluster = cluster_response['DBClusters'][0]
+                                    cluster_members = cluster.get('DBClusterMembers', [])
+                                    
+                                    # 找到writer节点
+                                    writer_node = None
+                                    for member in cluster_members:
+                                        if member.get('IsClusterWriter', False):
+                                            writer_node = member['DBInstanceIdentifier']
+                                            break
+                                    
+                                    # 如果当前实例不是writer，设置source_db_instance_identifier为writer节点
+                                    current_instance_id = db_instance['DBInstanceIdentifier']
+                                    if writer_node and current_instance_id != writer_node:
+                                        source_db_identifier = writer_node
+                                        self.logger.info(f"TAZ集群Reader节点 {current_instance_id} 的source_db_instance_identifier设置为Writer节点: {writer_node}")
+                                    else:
+                                        # 当前实例是writer节点
+                                        source_db_identifier = 'N/A'
+                                        
+                            except Exception as e:
+                                self.logger.warning(f"获取TAZ集群 {rds_cluster_id} Writer节点信息失败: {e}")
+                                source_db_identifier = 'N/A'
                     
                     instance_info = {
                         'db_instance_identifier': db_instance['DBInstanceIdentifier'],
                         'account_id': account_id,
                         'region': self.region,
-                        'mysql_engine_version': db_instance.get('EngineVersion', 'unknown'),
+                        'mysql_engine_version': engine_version,
                         'architecture': architecture,
                         'instance_class': instance_class,
                         'source_db_instance_identifier': source_db_identifier,
+                        'read_replica_source_db_cluster_identifier': source_cluster_identifier,
+                        'db_cluster_identifier': db_instance.get('DBClusterIdentifier', 'N/A'),
                         'multi_az': db_instance.get('MultiAZ', False),
                         'needs_aurora_conversion': True,  # 所有实例都需要Aurora转换测算
                         
@@ -891,6 +884,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
     def _determine_architecture_with_taz(self, db_instance: Dict, all_instances: List[Dict], aurora_clusters: Dict) -> str:
         """
         确定数据库实例的架构类型，支持TAZ（三可用区数据库集群部署）
+        通过describe-db-clusters API判断MAZ和TAZ
         
         Args:
             db_instance: RDS实例信息
@@ -901,42 +895,54 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             架构类型: 'single_az', 'multi_az', 'read_replica', 'taz_cluster'
         """
         db_identifier = db_instance['DBInstanceIdentifier']
-        cluster_identifier = db_instance.get('DBClusterIdentifier')
+        rds_cluster_id = db_instance.get('DBClusterIdentifier')
         
-        # 检查是否是Aurora集群成员
-        if cluster_identifier and cluster_identifier in aurora_clusters:
-            cluster_info = aurora_clusters[cluster_identifier]
-            member_count = len(cluster_info['members'])
-            
-            # 如果集群有3个或更多成员，认为是TAZ架构
-            if member_count >= 3:
-                self.logger.info(f"实例 {db_identifier} 属于TAZ集群 {cluster_identifier}，成员数: {member_count}")
-                return 'taz_cluster'
-            else:
-                # 少于3个成员的集群，按原有逻辑处理
-                if db_instance.get('MultiAZ', False):
-                    return 'multi_az'
-                else:
-                    return 'single_az'
+        # 优先通过describe-db-clusters API判断
+        if rds_cluster_id:
+            try:
+                cluster_response = self.rds_client.describe_db_clusters(
+                    DBClusterIdentifier=rds_cluster_id
+                )
+                
+                if cluster_response['DBClusters']:
+                    cluster = cluster_response['DBClusters'][0]
+                    cluster_members = cluster.get('DBClusterMembers', [])
+                    member_count = len(cluster_members)
+                    is_multi_az = cluster.get('MultiAZ', False)
+                    
+                    # TAZ集群：恰好3个成员（1个writer + 2个可读read replica）
+                    if member_count == 3:
+                        self.logger.info(f"实例 {db_identifier} 属于TAZ集群 {rds_cluster_id}，成员数: {member_count}")
+                        return 'taz_cluster'
+                    # MAZ集群：2个成员且MultiAZ=true
+                    elif member_count == 2 and is_multi_az:
+                        self.logger.info(f"实例 {db_identifier} 属于MAZ集群 {rds_cluster_id}，成员数: {member_count}, MultiAZ: {is_multi_az}")
+                        return 'multi_az'
+                    # 单个成员或其他情况
+                    elif member_count == 1:
+                        return 'single_az'
+                    else:
+                        # 2个成员但非MultiAZ，按single_az处理
+                        return 'single_az'
+                        
+            except Exception as e:
+                self.logger.warning(f"获取集群 {rds_cluster_id} 信息失败: {e}")
+                # 回退到原有逻辑
+                pass
         
-        # 非Aurora集群实例，按原有逻辑处理
+        # 非集群实例，检查source_db_instance_identifier
         source_db = db_instance.get('ReadReplicaSourceDBInstanceIdentifier')
-        
         if source_db and all_instances:
-            # 检查是否存在匹配的主实例
             source_exists = any(inst.get('DBInstanceIdentifier') == source_db for inst in all_instances)
-            
             if source_exists:
-                # 存在匹配的主实例，这是一个read replica
                 if db_instance.get('MultiAZ', False):
                     return 'multi_az'
                 else:
                     return 'single_az'
             else:
-                # 不存在匹配的主实例，这是一个孤儿read replica
                 return 'read_replica'
         
-        # 没有source_db_instance_identifier，按原逻辑处理
+        # 最后回退到实例级别的MultiAZ判断
         if db_instance.get('MultiAZ', False):
             return 'multi_az'
         else:
@@ -1081,14 +1087,6 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         except Exception as e:
             self.logger.error(f"获取RDS MySQL定价失败: {e}")
 
-    def get_rds_mysql_pricing(self) -> None:
-        """
-        获取当前区域所有RDS MySQL实例的1年RI无预付Single-AZ定价
-        将所有定价信息存储在pricing_cache中
-        （保持向后兼容性的方法，实际调用get_all_rds_mysql_pricing）
-        """
-        self.get_all_rds_mysql_pricing()
-            
     def get_instance_pricing_from_cache(self, instance_class: str) -> Optional[float]:
         """
         从pricing_cache中获取指定实例类型的定价
@@ -1499,6 +1497,77 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             月度费用
         """
         return hourly_rate * 730  # 假设每月30天
+    def identify_rds_mysql_clusters(self, instances: List[Dict]) -> Dict[str, List[str]]:
+        """
+        通过source_db_instance_identifier和ReadReplicaSourceDBClusterIdentifier识别RDS MySQL集群
+        
+        Args:
+            instances: 所有RDS实例列表
+            
+        Returns:
+            集群字典: {primary_instance: [replica1, replica2, ...]}
+        """
+        clusters = {}
+        cluster_to_primary = {}  # 集群ID到Primary实例的映射
+        
+        # 第一步：找到所有集群的Primary节点
+        for instance in instances:
+            instance_id = instance['db_instance_identifier']
+            cluster_id = instance.get('db_cluster_identifier')
+            
+            if cluster_id:
+                # 通过API获取集群信息找到Primary节点
+                try:
+                    cluster_response = self.rds_client.describe_db_clusters(
+                        DBClusterIdentifier=cluster_id
+                    )
+                    if cluster_response['DBClusters']:
+                        cluster = cluster_response['DBClusters'][0]
+                        for member in cluster.get('DBClusterMembers', []):
+                            if member.get('IsClusterWriter', False):
+                                cluster_to_primary[cluster_id] = member['DBInstanceIdentifier']
+                                break
+                except Exception as e:
+                    self.logger.warning(f"获取集群 {cluster_id} 信息失败: {e}")
+        
+        # 第二步：识别集群关系
+        for instance in instances:
+            instance_id = instance['db_instance_identifier']
+            source_db = instance.get('source_db_instance_identifier')
+            source_cluster = instance.get('read_replica_source_db_cluster_identifier')
+            
+            if source_db and source_db != 'N/A':
+                # 通过实例ID的Read Replica
+                if source_db not in clusters:
+                    clusters[source_db] = []
+                clusters[source_db].append(instance_id)
+                self.logger.info(f"实例 {instance_id} 是 {source_db} 的Read Replica")
+            elif source_cluster:
+                # 通过集群ID的Read Replica
+                primary_instance = cluster_to_primary.get(source_cluster)
+                if primary_instance:
+                    if primary_instance not in clusters:
+                        clusters[primary_instance] = []
+                    clusters[primary_instance].append(instance_id)
+                    self.logger.info(f"实例 {instance_id} 是集群 {source_cluster} (Primary: {primary_instance}) 的Read Replica")
+            else:
+                # 检查是否有其他实例以此为source
+                has_replicas = any(
+                    inst.get('source_db_instance_identifier') == instance_id 
+                    for inst in instances
+                )
+                # 检查是否有集群以此实例为Primary
+                has_cluster_replicas = any(
+                    cluster_to_primary.get(inst.get('read_replica_source_db_cluster_identifier')) == instance_id
+                    for inst in instances
+                )
+                
+                if (has_replicas or has_cluster_replicas) and instance_id not in clusters:
+                    clusters[instance_id] = []
+                    self.logger.info(f"实例 {instance_id} 是Primary节点")
+        
+        return clusters
+
     def analyze_instances(self) -> List[Dict]:
         """
         分析所有RDS MySQL实例并计算定价（包括存储成本）
@@ -1522,7 +1591,21 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         self.get_all_storage_pricing()  # 一次性获取所有存储类型定价
         self.get_aurora_storage_pricing()  # 一次性获取Aurora存储定价
         
-        instances = self.get_all_rds_mysql_instances()  
+        instances = self.get_all_rds_mysql_instances()
+        
+        # 识别RDS MySQL集群并设置正确的source_db_instance_identifier
+        rds_mysql_clusters = self.identify_rds_mysql_clusters(instances)
+        self.logger.info(f"识别到 {len(rds_mysql_clusters)} 个RDS MySQL集群")
+        
+        # 为TAZ集群的Reader节点设置正确的source_db_instance_identifier
+        for instance in instances:
+            instance_id = instance['db_instance_identifier']
+            
+            # 如果是RDS MySQL集群的Reader节点，设置source_db_instance_identifier
+            for primary, replicas in rds_mysql_clusters.items():
+                if instance_id in replicas and len(replicas) >= 2:
+                    instance['source_db_instance_identifier'] = primary
+                    self.logger.info(f"RDS MySQL集群Reader节点 {instance_id} 的source_db_instance_identifier设置为Primary节点: {primary}")  
         results = []
         
         # 按集群分组计算Aurora存储成本
@@ -1598,14 +1681,15 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     }
                     self.logger.info(f"RDS MySQL集群Read Replica节点 {instance['db_instance_identifier']} 不承担存储成本")
             elif instance['architecture'] == 'taz_cluster':
-                # TAZ集群：只有Primary节点承担存储成本
-                if instance.get('is_cluster_primary', False):
+                # TAZ集群：只有Writer节点承担存储成本
+                # 通过source_db_instance_identifier判断：N/A表示writer节点
+                if instance.get('source_db_instance_identifier') == 'N/A':
                     aurora_storage_cost_fields = {
                         'aurora_allocate_storage_gb': cluster_aurora_cost.get('aurora_storage_gb', 0),
                         'aurora_storage_price_per_gb_month_usd': cluster_aurora_cost.get('aurora_storage_price_per_gb_month', 0),
                         'aurora_total_storage_cost_per_month_usd': cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)
                     }
-                    self.logger.info(f"TAZ集群Primary节点 {instance['db_instance_identifier']} 承担存储成本: "
+                    self.logger.info(f"TAZ集群Writer节点 {instance['db_instance_identifier']} 承担存储成本: "
                                    f"${cluster_aurora_cost.get('aurora_total_storage_cost_per_month', 0)}")
                 else:
                     # Reader节点：Aurora存储成本填0
@@ -1652,7 +1736,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 'account_id': instance['account_id'],
                 'region': instance['region'],
                 # 集群信息
-                'cluster_id': cluster_id,
+                'cluster_primary_instance': self._get_cluster_primary_instance(instance, rds_clusters),
                 #'cluster_role': instance.get('cluster_role', 'standalone'),
                 #'is_cluster_primary': instance.get('is_cluster_primary', True),
                 'mysql_engine_version': instance['mysql_engine_version'],
@@ -1715,19 +1799,29 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                         aurora_adjusted_rate = aurora_hourly_rate
                         self.logger.info(f"实例 {instance['db_instance_identifier']} 是TAZ集群成员，Aurora {generation}使用单价")
                     elif instance['architecture'] == 'multi_az':
-                        # Multi-AZ：检查是否有read replica
+                        # Multi-AZ：检查是否有read replica或者是否为其他集群的read replica
                         has_read_replica = any(
                             inst.get('source_db_instance_identifier') == instance['db_instance_identifier']
                             for inst in instances
                         )
-                        if has_read_replica:
-                            # MAZ + Read Replica：Aurora不乘以2
+                        
+                        # 检查当前实例是否为其他集群的read replica
+                        is_cluster_read_replica = (
+                            instance.get('source_db_instance_identifier') != 'N/A' and
+                            instance.get('source_db_instance_identifier') is not None
+                        )
+                        
+                        if has_read_replica or is_cluster_read_replica:
+                            # MAZ + Read Replica 或者 集群Read Replica：Aurora实例成本不乘以2
                             aurora_adjusted_rate = aurora_hourly_rate
-                            self.logger.info(f"实例 {instance['db_instance_identifier']} 是MAZ+ReadReplica，Aurora {generation}不乘以2")
+                            if is_cluster_read_replica:
+                                self.logger.info(f"实例 {instance['db_instance_identifier']} 是集群Read Replica，Aurora {generation}实例成本不乘以2")
+                            else:
+                                self.logger.info(f"实例 {instance['db_instance_identifier']} 是MAZ+ReadReplica，Aurora {generation}实例成本不乘以2")
                         else:
-                            # 仅MAZ：Aurora乘以2
+                            # 仅MAZ：Aurora实例成本乘以2
                             aurora_adjusted_rate = aurora_hourly_rate * 2
-                            self.logger.info(f"实例 {instance['db_instance_identifier']} 是仅MAZ，Aurora {generation}乘以2")
+                            self.logger.info(f"实例 {instance['db_instance_identifier']} 是仅MAZ，Aurora {generation}实例成本乘以2")
                 else:
                     aurora_adjusted_rate = aurora_hourly_rate
                 
@@ -1762,13 +1856,13 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                     self.logger.info(f"RDS MySQL集群Primary节点 {instance['db_instance_identifier']} "
                                    f"Aurora {generation} 存储成本: ${aurora_storage_mrr}")
                 
-                # 检查是否为TAZ集群的Primary节点
+                # 检查是否为TAZ集群的Writer节点
                 elif (instance['architecture'] == 'taz_cluster' and 
-                      instance.get('is_cluster_primary', False) and 
+                      instance.get('source_db_instance_identifier') == 'N/A' and 
                       aurora_storage_cost_fields.get('aurora_total_storage_cost_per_month_usd', 0) > 0):
                     
                     aurora_storage_mrr = aurora_storage_cost_fields['aurora_total_storage_cost_per_month_usd']
-                    self.logger.info(f"TAZ集群Primary节点 {instance['db_instance_identifier']} "
+                    self.logger.info(f"TAZ集群Writer节点 {instance['db_instance_identifier']} "
                                    f"Aurora {generation} 存储成本: ${aurora_storage_mrr}")
                 
                 # 检查是否为其他架构的Primary节点
@@ -2023,7 +2117,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
 
     def _identify_rds_mysql_clusters(self, instances: List[Dict]) -> Dict[str, List[Dict]]:
         """
-        识别RDS MySQL集群（基于source_db_instance_identifier）
+        识别RDS MySQL集群（基于describe-db-clusters API）
         
         Args:
             instances: 所有实例列表
@@ -2032,32 +2126,86 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             RDS MySQL集群字典，key为primary实例ID，value为集群实例列表
         """
         rds_clusters = {}
-        
-        # 创建实例映射
-        instance_map = {inst['db_instance_identifier']: inst for inst in instances}
+        processed_clusters = set()
         
         for instance in instances:
-            source_db = instance.get('source_db_instance_identifier')
-            
-            # 如果有source_db_instance_identifier且不是特殊值
-            if source_db and source_db not in ['N/A', 'writer-node']:
-                # 检查source实例是否存在于当前实例列表中
-                if source_db in instance_map:
-                    primary_instance = instance_map[source_db]
-                    primary_id = primary_instance['db_instance_identifier']
+            cluster_id = instance.get('DBClusterIdentifier')
+            if not cluster_id or cluster_id in processed_clusters:
+                continue
+                
+            try:
+                # 通过API获取集群信息
+                cluster_response = self.rds_client.describe_db_clusters(
+                    DBClusterIdentifier=cluster_id
+                )
+                
+                if cluster_response['DBClusters']:
+                    cluster = cluster_response['DBClusters'][0]
+                    cluster_members = cluster.get('DBClusterMembers', [])
                     
-                    # 初始化集群
-                    if primary_id not in rds_clusters:
-                        rds_clusters[primary_id] = [primary_instance]
+                    # 找到writer节点
+                    writer_node = None
+                    for member in cluster_members:
+                        if member.get('IsClusterWriter', False):
+                            writer_node = member['DBInstanceIdentifier']
+                            break
                     
-                    # 添加read replica到集群
-                    if instance not in rds_clusters[primary_id]:
-                        rds_clusters[primary_id].append(instance)
-                    
-                    self.logger.info(f"识别到RDS MySQL集群: Primary={primary_id}, "
-                                   f"Read Replica={instance['db_instance_identifier']}")
+                    if writer_node and len(cluster_members) > 1:
+                        # 构建集群实例列表
+                        cluster_instances = []
+                        for member in cluster_members:
+                            member_id = member['DBInstanceIdentifier']
+                            # 在instances中找到对应的实例
+                            for inst in instances:
+                                if inst['db_instance_identifier'] == member_id:
+                                    cluster_instances.append(inst)
+                                    break
+                        
+                        if len(cluster_instances) > 1:
+                            rds_clusters[writer_node] = cluster_instances
+                            processed_clusters.add(cluster_id)
+                            
+                            # 记录集群关系
+                            for inst in cluster_instances:
+                                if inst['db_instance_identifier'] != writer_node:
+                                    self.logger.info(f"识别到RDS MySQL集群: Primary={writer_node}, "
+                                                   f"Read Replica={inst['db_instance_identifier']}")
+                        
+            except Exception as e:
+                self.logger.warning(f"获取集群 {cluster_id} 信息失败: {e}")
+                continue
         
         return rds_clusters
+
+    def _get_cluster_primary_instance(self, instance: Dict, rds_clusters: Dict[str, List[Dict]]) -> str:
+        """
+        获取实例所属集群的Primary实例标识
+        
+        Args:
+            instance: 实例信息
+            rds_clusters: RDS MySQL集群字典
+            
+        Returns:
+            集群Primary实例标识
+        """
+        instance_id = instance['db_instance_identifier']
+        
+        # 检查是否是RDS MySQL集群的primary节点
+        if instance_id in rds_clusters:
+            return instance_id
+        
+        # 检查是否是RDS MySQL集群的read replica
+        for primary_id, cluster_instances in rds_clusters.items():
+            if instance in cluster_instances and instance_id != primary_id:
+                return primary_id
+        
+        # 检查source_db_instance_identifier
+        source_db = instance.get('source_db_instance_identifier')
+        if source_db and source_db != 'N/A':
+            return source_db
+        
+        # 默认返回实例自身
+        return instance_id
 
     def _determine_cluster_id(self, instance: Dict, rds_clusters: Dict[str, List[Dict]]) -> str:
         """
@@ -2120,90 +2268,84 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         
         return False
 
-    def generate_cluster_summary_by_series(self, results: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    def generate_cluster_summary(self, results: List[Dict]) -> List[Dict]:
         """
-        按实例系列生成集群汇总数据，分为M/C系列和R系列
+        生成集群汇总数据，合并所有实例系列
+        基于RDS MySQL集群进行汇总
         
         Args:
             results: 详细分析结果列表
             
         Returns:
-            (M/C系列集群汇总, R系列集群汇总)
+            集群汇总列表
         """
-        mc_clusters = {}
-        r_clusters = {}
+        clusters = {}
         
         for result in results:
-            cluster_id = result.get('cluster_id', 'unknown')
+            # 确定集群标识：优先使用source_db_instance_identifier的Primary节点，否则使用实例自身
+            source_db = result.get('source_db_instance_identifier', 'N/A')
+            if source_db != 'N/A' and source_db is not None:
+                cluster_key = source_db  # 使用Primary节点作为集群标识
+            else:
+                cluster_key = result.get('db_instance_identifier', 'unknown')  # Primary节点使用自身
+            
             rds_instance_class = result.get('rds_instance_class', '')
             
             # 判断实例系列
             instance_family = rds_instance_class.replace('db.', '').split('.')[0] if rds_instance_class else ''
-            is_r_series = instance_family.startswith('r')
+            series_type = 'R系列' if instance_family.startswith('r') else 'M/C系列'
             
-            # 选择对应的集群字典
-            target_clusters = r_clusters if is_r_series else mc_clusters
-            
-            if cluster_id not in target_clusters:
+            if cluster_key not in clusters:
                 base_fields = {
                     'account_id': result.get('account_id'),
                     'region': result.get('region'),
-                    'cluster_id': cluster_id,
+                    'cluster_primary_instance': cluster_key,
                     'instance_count': 0,
                     'rds_total_mrr_usd': 0,
                     'aurora_r7g_standard_total_mrr_usd': 0,
                     'aurora_r8g_standard_total_mrr_usd': 0,
                     'aurora_r7g_optimized_total_mrr_usd': 0,
-                    'aurora_r8g_optimized_total_mrr_usd': 0
+                    'aurora_r8g_optimized_total_mrr_usd': 0,
+                    'replacement_r7g_m7g_total_mrr_usd': 0,
+                    'replacement_r8g_m8g_total_mrr_usd': 0
                 }
                 
-                # 根据系列添加相应的RDS替换字段
-                if is_r_series:
-                    base_fields.update({
-                        'rds_replacement_r7g_total_mrr_usd': 0,
-                        'rds_replacement_r8g_total_mrr_usd': 0
-                    })
-                else:
-                    base_fields.update({
-                        'rds_replacement_m7g_total_mrr_usd': 0,
-                        'rds_replacement_m8g_total_mrr_usd': 0
-                    })
-                
-                target_clusters[cluster_id] = base_fields
+                clusters[cluster_key] = base_fields
             
-            summary = target_clusters[cluster_id]
+            summary = clusters[cluster_key]
             summary['instance_count'] += 1
             
-            # 汇总通用成本字段
-            common_fields = ['rds_total_mrr_usd', 'aurora_r7g_standard_total_mrr_usd', 'aurora_r8g_standard_total_mrr_usd',
-                           'aurora_r7g_optimized_total_mrr_usd', 'aurora_r8g_optimized_total_mrr_usd']
+            # 汇总所有成本字段
+            cost_fields = ['rds_total_mrr_usd', 'aurora_r7g_standard_total_mrr_usd', 'aurora_r8g_standard_total_mrr_usd',
+                          'aurora_r7g_optimized_total_mrr_usd', 'aurora_r8g_optimized_total_mrr_usd']
             
-            # 根据系列添加相应的RDS替换字段
-            if is_r_series:
-                relevant_fields = common_fields + ['rds_replacement_r7g_total_mrr_usd', 'rds_replacement_r8g_total_mrr_usd']
-            else:
-                relevant_fields = common_fields + ['rds_replacement_m7g_total_mrr_usd', 'rds_replacement_m8g_total_mrr_usd']
-            
-            for field in relevant_fields:
+            for field in cost_fields:
                 value = result.get(field, 0)
                 if isinstance(value, (int, float)):
                     summary[field] += value
+            
+            # 合并RDS替换成本字段
+            r7g_m7g_cost = (result.get('rds_replacement_r7g_total_mrr_usd', 0) + 
+                           result.get('rds_replacement_m7g_total_mrr_usd', 0))
+            r8g_m8g_cost = (result.get('rds_replacement_r8g_total_mrr_usd', 0) + 
+                           result.get('rds_replacement_m8g_total_mrr_usd', 0))
+            
+            summary['replacement_r7g_m7g_total_mrr_usd'] += r7g_m7g_cost
+            summary['replacement_r8g_m8g_total_mrr_usd'] += r8g_m8g_cost
         
         # 转换为列表并四舍五入
-        def process_summaries(cluster_dict):
-            summary_list = []
-            for summary in cluster_dict.values():
-                for key, value in summary.items():
-                    if key.endswith('_usd') and isinstance(value, (int, float)):
-                        summary[key] = round(value, 2)
-                summary_list.append(summary)
-            return summary_list
+        summary_list = []
+        for summary in clusters.values():
+            for key, value in summary.items():
+                if key.endswith('_usd') and isinstance(value, (int, float)):
+                    summary[key] = round(value, 2)
+            summary_list.append(summary)
         
-        return process_summaries(mc_clusters), process_summaries(r_clusters)
+        return summary_list
 
     def export_to_excel(self, results: List[Dict], output_file: str):
         """
-        将分析结果导出到Excel文件，包含详细数据和集群汇总两个sheet
+        将分析结果导出到Excel文件，包含详细数据和集群成本汇总两个sheet
         
         Args:
             results: 分析结果列表
@@ -2214,8 +2356,8 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
             return
         
         try:
-            # 生成按系列分组的集群汇总数据
-            mc_summary, r_summary = self.generate_cluster_summary_by_series(results)
+            # 生成集群汇总数据
+            cluster_summary = self.generate_cluster_summary(results)
             
             # 创建Excel writer
             excel_file = output_file.replace('.csv', '.xlsx')
@@ -2224,18 +2366,13 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
                 df_details = pd.DataFrame(results)
                 df_details.to_excel(writer, sheet_name='详细数据', index=False)
                 
-                # M/C系列集群汇总sheet
-                if mc_summary:
-                    df_mc_summary = pd.DataFrame(mc_summary)
-                    df_mc_summary.to_excel(writer, sheet_name='M_C系列集群汇总', index=False)
-                
-                # R系列集群汇总sheet
-                if r_summary:
-                    df_r_summary = pd.DataFrame(r_summary)
-                    df_r_summary.to_excel(writer, sheet_name='R系列集群汇总', index=False)
+                # 集群成本汇总sheet
+                if cluster_summary:
+                    df_cluster_summary = pd.DataFrame(cluster_summary)
+                    df_cluster_summary.to_excel(writer, sheet_name='cluster成本汇总', index=False)
             
             self.logger.info(f"Excel结果已导出到: {excel_file}")
-            self.logger.info(f"包含 {len(results)} 条详细记录, {len(mc_summary)} 个M/C系列集群, {len(r_summary)} 个R系列集群")
+            self.logger.info(f"包含 {len(results)} 条详细记录, {len(cluster_summary)} 个集群汇总")
             
         except Exception as e:
             self.logger.error(f"导出Excel失败: {e}")
@@ -2259,7 +2396,7 @@ class RDSAuroraMultiGenerationPricingAnalyzer:
         base_fieldnames = [
             'account_id', 
             'region',
-            'cluster_id',
+            'cluster_primary_instance',
             'mysql_engine_version',
             'db_instance_identifier',
             'source_db_instance_identifier',
@@ -2380,53 +2517,53 @@ def main():
         analyzer = RDSAuroraMultiGenerationPricingAnalyzer(args.region)
         
         # 执行分析
-        print(f"开始分析区域 {args.region} 的RDS MySQL实例...")
-        print("支持M/R/C系列实例类型")
-        print("将计算Aurora r7g、r8g两种实例类型的转换成本")
-        print("将计算RDS替换成本：")
-        print("  - M系列实例：m7g、m8g")
-        print("  - R系列实例：r7g、r8g") 
-        print("  - C系列实例：m7g、m8g（Graviton3/4迁移）")
-        print("分别计算实例MRR、存储MRR和总MRR成本")
-        print("包含存储类型、容量、IOPS、带宽和存储成本分析")
-        print("支持TAZ（三可用区数据库集群部署）架构")
+        analyzer._print_progress(f"开始分析区域 {args.region} 的RDS MySQL实例...")
+        analyzer._print_progress("支持M/R/C系列实例类型")
+        analyzer._print_progress("将计算Aurora r7g、r8g两种实例类型的转换成本")
+        analyzer._print_progress("将计算RDS替换成本：")
+        analyzer._print_progress("  - M系列实例：m7g、m8g")
+        analyzer._print_progress("  - R系列实例：r7g、r8g") 
+        analyzer._print_progress("  - C系列实例：m7g、m8g（Graviton3/4迁移）")
+        analyzer._print_progress("分别计算实例MRR、存储MRR和总MRR成本")
+        analyzer._print_progress("包含存储类型、容量、IOPS、带宽和存储成本分析")
+        analyzer._print_progress("支持TAZ（三可用区数据库集群部署）架构")
         results = analyzer.analyze_instances()
         
         if results:
             # 导出结果
             analyzer.export_to_excel(results, args.output)
-            print(f"分析完成！共处理 {len(results)} 个实例，结果已保存到 {args.output.replace('.csv', '.xlsx')}")
-            print("RDS成本包含：")
-            print("- 实例MRR：RDS实例的月度费用（不含存储）")
-            print("- 存储MRR：RDS存储的月度费用")
-            print("- 总MRR：实例MRR + 存储MRR")
-            print("Aurora转换成本包含：")
-            print("- 实例MRR：Aurora实例的月度费用（不含存储）")
-            print("- 存储MRR：Aurora存储的月度费用（基于Primary节点的used_storage_gb）")
-            print("- 总MRR：实例MRR + 存储MRR")
-            print("RDS替换成本包含：")
-            print("- 实例MRR：RDS替换实例的月度费用（不含存储）")
-            print("- 存储MRR：RDS替换存储的月度费用")
-            print("- 总MRR：实例MRR + 存储MRR")
-            print("存储成本分配规则：")
-            print("- RDS场景：Multi-AZ实例存储成本×2")
-            print("- Aurora迁移场景：Multi-AZ实例存储成本仅计算一份，不乘以2")
-            print("- TAZ集群存储成本仅分配到Primary节点")
-            print("- Multi-AZ + Read Replica迁移到Aurora时，存储成本仅分配到Primary节点，计算一份")
-            print("- RDS MySQL集群：通过source_db_instance_identifier识别集群关系")
-            print("- RDS MySQL集群迁移到Aurora：存储成本仅计算一次，加和到Primary节点")
-            print("- Aurora存储成本基于Primary节点的实际使用量(used_storage_gb)计算")
-            print("- 符合Aurora共享存储特性，不累加集群中所有节点的存储量")
-            print("- Read Replica节点的Aurora存储成本为0，避免重复计算")
-            print("- 计算r7g和r8g两种实例类型的Aurora转换成本")
-            print("- M系列实例：计算m7g、m8g的RDS替换成本")
-            print("- R系列实例：计算r7g、r8g的RDS替换成本")
-            print("- C系列实例：计算m7g、m8g的RDS替换成本（Graviton3/4迁移）")
-            print("实例迁移策略：")
-            print("- Aurora迁移：所有实例类型（M/R/C系列）统一迁移到r7g、r8g")
-            print("- Graviton迁移：M/C系列→m7g、m8g，R系列→r7g、r8g")
+            analyzer._print_progress(f"分析完成！共处理 {len(results)} 个实例，结果已保存到 {args.output.replace('.csv', '.xlsx')}")
+            analyzer._print_progress("RDS成本包含：")
+            analyzer._print_progress("- 实例MRR：RDS实例的月度费用（不含存储）")
+            analyzer._print_progress("- 存储MRR：RDS存储的月度费用")
+            analyzer._print_progress("- 总MRR：实例MRR + 存储MRR")
+            analyzer._print_progress("Aurora转换成本包含：")
+            analyzer._print_progress("- 实例MRR：Aurora实例的月度费用（不含存储）")
+            analyzer._print_progress("- 存储MRR：Aurora存储的月度费用（基于Primary节点的used_storage_gb）")
+            analyzer._print_progress("- 总MRR：实例MRR + 存储MRR")
+            analyzer._print_progress("RDS替换成本包含：")
+            analyzer._print_progress("- 实例MRR：RDS替换实例的月度费用（不含存储）")
+            analyzer._print_progress("- 存储MRR：RDS替换存储的月度费用")
+            analyzer._print_progress("- 总MRR：实例MRR + 存储MRR")
+            analyzer._print_progress("存储成本分配规则：")
+            analyzer._print_progress("- RDS场景：Multi-AZ实例存储成本×2")
+            analyzer._print_progress("- Aurora迁移场景：Multi-AZ实例存储成本仅计算一份，不乘以2")
+            analyzer._print_progress("- TAZ集群存储成本仅分配到Primary节点")
+            analyzer._print_progress("- Multi-AZ + Read Replica迁移到Aurora时，存储成本仅分配到Primary节点，计算一份")
+            analyzer._print_progress("- RDS MySQL集群：通过source_db_instance_identifier识别集群关系")
+            analyzer._print_progress("- RDS MySQL集群迁移到Aurora：存储成本仅计算一次，加和到Primary节点")
+            analyzer._print_progress("- Aurora存储成本基于Primary节点的实际使用量(used_storage_gb)计算")
+            analyzer._print_progress("- 符合Aurora共享存储特性，不累加集群中所有节点的存储量")
+            analyzer._print_progress("- Read Replica节点的Aurora存储成本为0，避免重复计算")
+            analyzer._print_progress("- 计算r7g和r8g两种实例类型的Aurora转换成本")
+            analyzer._print_progress("- M系列实例：计算m7g、m8g的RDS替换成本")
+            analyzer._print_progress("- R系列实例：计算r7g、r8g的RDS替换成本")
+            analyzer._print_progress("- C系列实例：计算m7g、m8g的RDS替换成本（Graviton3/4迁移）")
+            analyzer._print_progress("实例迁移策略：")
+            analyzer._print_progress("- Aurora迁移：所有实例类型（M/R/C系列）统一迁移到r7g、r8g")
+            analyzer._print_progress("- Graviton迁移：M/C系列→m7g、m8g，R系列→r7g、r8g")
         else:
-            print("未找到任何RDS MySQL实例")
+            analyzer._print_progress("未找到任何RDS MySQL实例")
             
     except NoCredentialsError:
         print("错误: 未找到AWS凭证。请配置AWS凭证后重试。")
