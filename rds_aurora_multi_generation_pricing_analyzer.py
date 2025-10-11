@@ -691,84 +691,86 @@ class CompleteUnifiedRDSAuroraAnalyzer:
         try:
             self.logger.info(f"开始获取区域 {self.region} 的Aurora存储定价...")
             
-            # 获取Aurora存储定价
-            filters = [
+            pricing_info = {
+                'storage_gb_month': 0,
+                'io_million_requests': 0
+            }
+            
+            # 获取Aurora存储单价
+            storage_filters = [
                 {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
-                {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'},
-                {'Type': 'TERM_MATCH', 'Field': 'usagetype', 'Value': 'Aurora:StorageUsage'},
-                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
+                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()},
+                {'Type': 'TERM_MATCH', 'Field': 'productFamily', 'Value': 'Database Storage'},
+                {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'}
             ]
             
-            response = self.pricing_client.get_products(
+            storage_response = self.pricing_client.get_products(
                 ServiceCode='AmazonRDS',
-                Filters=filters,
+                Filters=storage_filters,
                 MaxResults=10
             )
             
-            storage_price = 0.1  # 默认值
-            for price_item in response['PriceList']:
-                product = json.loads(price_item)
-                terms = product.get('terms', {})
-                on_demand_terms = terms.get('OnDemand', {})
+            if storage_response['PriceList']:
+                product = json.loads(storage_response['PriceList'][0])
+                terms = product.get('terms', {}).get('OnDemand', {})
                 
-                for term_key, term_data in on_demand_terms.items():
-                    price_dimensions = term_data.get('priceDimensions', {})
-                    for price_key, price_data in price_dimensions.items():
-                        price_per_unit = price_data.get('pricePerUnit', {})
-                        usd_price = price_per_unit.get('USD')
-                        if usd_price:
-                            storage_price = float(usd_price)
+                for term_data in terms.values():
+                    for price_data in term_data.get('priceDimensions', {}).values():
+                        usd_price = price_data.get('pricePerUnit', {}).get('USD')
+                        if usd_price and 'GB-Mo' in price_data.get('unit', ''):
+                            pricing_info['storage_gb_month'] = round(float(usd_price)/2.25,3)
+                            self.logger.info(f"Aurora存储单价: ${round(float(usd_price)/2.25,3)}/GB/月")
                             break
+                    else:
+                        continue
                     break
-                break
             
-            self.logger.info(f"Aurora存储单价: ${storage_price}/GB/月")
-            
-            # 获取Aurora IO定价
+            # 获取Aurora IO请求单价 - 使用实时API
             self.logger.info("通过API获取Aurora IO定价...")
-            io_price = 0.2  # 默认值
             
-            try:
-                filters = [
-                    {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
+            # 使用分页器获取Aurora产品
+            paginator = self.pricing_client.get_paginator('get_products')
+            
+            for page in paginator.paginate(
+                ServiceCode='AmazonRDS',
+                Filters=[
                     {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'},
-                    {'Type': 'TERM_MATCH', 'Field': 'usagetype', 'Value': 'Aurora:StorageIOUsage'},
-                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
+                    {'Type': 'TERM_MATCH', 'Field': 'regionCode', 'Value': self.region}
                 ]
-                
-                response = self.pricing_client.get_products(
-                    ServiceCode='AmazonRDS',
-                    Filters=filters,
-                    MaxResults=10
-                )
-                
-                for price_item in response['PriceList']:
-                    product = json.loads(price_item)
-                    terms = product.get('terms', {})
-                    on_demand_terms = terms.get('OnDemand', {})
+            ):
+                for product_str in page['PriceList']:
+                    product = json.loads(product_str)
                     
-                    for term_key, term_data in on_demand_terms.items():
-                        price_dimensions = term_data.get('priceDimensions', {})
-                        for price_key, price_data in price_dimensions.items():
-                            price_per_unit = price_data.get('pricePerUnit', {})
-                            usd_price = price_per_unit.get('USD')
-                            if usd_price:
-                                io_price = float(usd_price)
-                                break
+                    # 获取定价信息
+                    terms = product.get('terms', {}).get('OnDemand', {})
+                    for term_data in terms.values():
+                        for price_data in term_data.get('priceDimensions', {}).values():
+                            unit = price_data.get('unit', '')
+                            
+                            # 查找IO单位的定价
+                            if unit == 'IOs':
+                                price_per_unit = price_data.get('pricePerUnit', {})
+                                price_per_io = price_per_unit.get('USD', '0')
+                                
+                                if float(price_per_io) > 0:
+                                    price_per_million = float(price_per_io) * 1000000
+                                    pricing_info['io_million_requests'] = price_per_million
+                                    self.logger.info(f"Aurora IO请求单价: ${price_per_million}/百万次请求")
+                                    break
+                        else:
+                            continue
                         break
+                    if pricing_info['io_million_requests'] > 0:
+                        break
+                if pricing_info['io_million_requests'] > 0:
                     break
-                    
-            except Exception as e:
-                self.logger.warning(f"获取Aurora IO定价失败，使用默认值: {e}")
             
-            self.logger.info(f"Aurora IO请求单价: ${io_price}/百万次请求")
+            # 如果API未获取到IO定价，设置为0并记录错误
+            if pricing_info['io_million_requests'] == 0:
+                self.logger.error(f"未获取到Aurora IO定价")
             
-            self.aurora_storage_pricing_cache = {
-                'storage_gb_month': storage_price,
-                'io_million_requests': io_price
-            }
-            
-            self.logger.info("Aurora存储定价获取完成")
+            self.aurora_storage_pricing_cache = pricing_info
+            self.logger.info(f"Aurora存储定价获取完成")
             return self.aurora_storage_pricing_cache
             
         except Exception as e:
