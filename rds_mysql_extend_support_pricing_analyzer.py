@@ -15,6 +15,12 @@ import sys
 class RDSPricingAnalyzer:
     def __init__(self, region: str):
         self.region = region
+        
+        # 区域兼容性检查
+        if not self._check_region_compatibility():
+            print("\n❌ 脚本因区域兼容性问题终止执行")
+            sys.exit(1)
+        
         self.rds_client = boto3.client('rds', region_name=region)
         self.pricing_client = boto3.client('pricing', region_name='us-east-1')
         self.sts_client = boto3.client('sts', region_name=region)
@@ -22,6 +28,91 @@ class RDSPricingAnalyzer:
         # 缓存
         self.cpu_cores_cache = {}
         self._extended_support_cache = {}
+
+    def _get_current_ec2_region(self):
+        """获取当前EC2实例所在的区域"""
+        try:
+            import requests
+            # 尝试IMDSv2
+            token_response = requests.put(
+                'http://169.254.169.254/latest/api/token',
+                headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'},
+                timeout=2
+            )
+            if token_response.status_code == 200:
+                token = token_response.text
+                region_response = requests.get(
+                    'http://169.254.169.254/latest/meta-data/placement/region',
+                    headers={'X-aws-ec2-metadata-token': token},
+                    timeout=2
+                )
+                if region_response.status_code == 200:
+                    return region_response.text.strip()
+            
+            # 回退到IMDSv1
+            region_response = requests.get(
+                'http://169.254.169.254/latest/meta-data/placement/region',
+                timeout=2
+            )
+            if region_response.status_code == 200:
+                return region_response.text.strip()
+                
+        except Exception:
+            pass
+        
+        # 如果IMDS失败，尝试通过STS ARN推断
+        try:
+            sts_client = boto3.client('sts')
+            identity = sts_client.get_caller_identity()
+            arn = identity.get('Arn', '')
+            if ':cn-' in arn:
+                return 'cn-north-1'  # 默认中国区域
+            else:
+                return 'us-east-1'  # 默认全球区域
+        except:
+            return None
+
+    def _is_china_region(self, region):
+        """判断是否为中国区域"""
+        return region.startswith('cn-') if region else False
+
+    def _check_region_compatibility(self):
+        """检查区域兼容性"""
+        current_region = self._get_current_ec2_region()
+        
+        if not current_region:
+            print("⚠️  警告: 无法确定当前EC2实例所在区域，跳过兼容性检查")
+            return True
+        
+        current_is_china = self._is_china_region(current_region)
+        target_is_china = self._is_china_region(self.region)
+        
+        # 当前EC2在中国区域时，直接提示不支持
+        if current_is_china:
+            print(f"""
+❌ 不支持的运行环境！
+
+当前EC2实例位于: {current_region} (中国区域)
+此脚本不支持在中国区域运行。
+""")
+            return False
+        
+        # 当前EC2在全球区域，但目标是中国区域时的提示
+        elif not current_is_china and target_is_china:
+            print(f"""
+❌ 区域兼容性错误！
+
+当前EC2实例位于: {current_region} (全球区域)
+目标评估区域: {self.region} (中国区域)
+
+⚠️  在全球区域的EC2实例上无法评估中国区域的RDS实例！
+请在中国区域的EC2实例上运行此脚本来分析中国区域的RDS实例。
+""")
+            return False
+        
+        # 全球区域到全球区域
+        print(f"✅ 区域兼容性检查通过: {current_region} -> {self.region} (全球分区)")
+        return True
 
     def get_extended_support_pricing(self, cpu_cores: int) -> Dict[str, float]:
         """通过AWS Pricing API获取Extended Support每核心每小时的定价"""
@@ -168,15 +259,36 @@ class RDSPricingAnalyzer:
             return "unknown"
 
     def get_rds_instances(self) -> List[Dict[str, Any]]:
-        """获取指定region下的所有RDS MySQL实例"""
+        """获取指定region下的所有RDS MySQL实例和集群节点"""
         instances = []
         try:
+            # 获取RDS实例
             paginator = self.rds_client.get_paginator('describe_db_instances')
             
             for page in paginator.paginate():
+                # 获取当前页面的所有实例用于架构判断
+                all_page_instances = page['DBInstances']
+                
                 for db_instance in page['DBInstances']:
                     if db_instance['Engine'].lower() == 'mysql':
-                        architecture = self._determine_architecture(db_instance)
+                        architecture = self._determine_architecture(db_instance, all_page_instances)
+                        
+                        # 设置source_db_instance_identifier
+                        source_db_instance = ''
+                        if db_instance.get('ReadReplicaSourceDBInstanceIdentifier'):
+                            source_db_instance = db_instance['ReadReplicaSourceDBInstanceIdentifier']
+                        elif db_instance.get('ReadReplicaSourceDBClusterIdentifier'):
+                            # 集群级Read Replica，需要找到源集群的Writer节点
+                            source_cluster = db_instance['ReadReplicaSourceDBClusterIdentifier']
+                            try:
+                                cluster_response = self.rds_client.describe_db_clusters(DBClusterIdentifier=source_cluster)
+                                cluster = cluster_response['DBClusters'][0]
+                                for member in cluster.get('DBClusterMembers', []):
+                                    if member.get('IsClusterWriter', False):
+                                        source_db_instance = member['DBInstanceIdentifier']
+                                        break
+                            except Exception as e:
+                                print(f"获取源集群Writer失败: {e}")
                         
                         instance_info = {
                             'db_instance_identifier': db_instance['DBInstanceIdentifier'],
@@ -185,26 +297,122 @@ class RDSPricingAnalyzer:
                             'engine_version': db_instance['EngineVersion'],
                             'architecture': architecture,
                             'instance_class': db_instance['DBInstanceClass'],
+                            'instance_status': db_instance.get('DBInstanceStatus', ''),
                             'cpu_cores': self.get_instance_cpu_cores(db_instance['DBInstanceClass']),
                             'multi_az': db_instance.get('MultiAZ', False),
                             'read_replica_source': db_instance.get('ReadReplicaSourceDBInstanceIdentifier', ''),
+                            'source_db_instance_identifier': source_db_instance,
                             'availability_zone': db_instance.get('AvailabilityZone', ''),
+                            'db_cluster_identifier': db_instance.get('DBClusterIdentifier', ''),
                         }
                         instances.append(instance_info)
+            
+            # 获取RDS集群
+            try:
+                cluster_paginator = self.rds_client.get_paginator('describe_db_clusters')
+                
+                for page in cluster_paginator.paginate():
+                    for db_cluster in page['DBClusters']:
+                        if db_cluster['Engine'].lower() == 'mysql':
+                            cluster_members = db_cluster.get('DBClusterMembers', [])
+                            
+                            for member in cluster_members:
+                                member_instance_id = member['DBInstanceIdentifier']
+                                
+                                # 检查是否已经在实例列表中
+                                existing_instance = next(
+                                    (inst for inst in instances if inst['db_instance_identifier'] == member_instance_id), 
+                                    None
+                                )
+                                
+                                if existing_instance:
+                                    # 更新集群信息
+                                    existing_instance['is_cluster_member'] = True
+                                    existing_instance['cluster_architecture'] = 'multi_az_cluster' if db_cluster.get('MultiAZ', False) else 'single_az_cluster'
+                                    existing_instance['is_cluster_writer'] = member.get('IsClusterWriter', False)
+                                    
+            except Exception as e:
+                print(f"获取RDS集群信息失败: {e}")
                         
         except Exception as e:
             print(f"获取RDS实例失败: {e}")
+        
+        # 处理TAZ集群的source关系
+        self._set_taz_source_relationships(instances)
             
         return instances
 
-    def _determine_architecture(self, db_instance: Dict) -> str:
-        """判断RDS实例的架构类型"""
+    def _set_taz_source_relationships(self, instances):
+        """为TAZ集群设置source关系和架构"""
+        # 按集群分组
+        taz_clusters = {}
+        for instance in instances:
+            cluster_id = instance.get('db_cluster_identifier', '')
+            if cluster_id and 'taz' in cluster_id.lower():
+                if cluster_id not in taz_clusters:
+                    taz_clusters[cluster_id] = []
+                taz_clusters[cluster_id].append(instance)
+        
+        # 为每个TAZ集群设置source关系和架构
+        for cluster_id, cluster_instances in taz_clusters.items():
+            # 找到writer实例作为primary
+            writer_instance = None
+            for instance in cluster_instances:
+                if instance.get('is_cluster_writer', False):
+                    writer_instance = instance
+                    instance['architecture'] = 'taz_cluster_writer'
+                    break
+            
+            if writer_instance:
+                writer_id = writer_instance['db_instance_identifier']
+                # 将非writer实例设置为read replica
+                for instance in cluster_instances:
+                    if not instance.get('is_cluster_writer', False):
+                        instance['source_db_instance_identifier'] = writer_id
+                        instance['architecture'] = 'taz_cluster_reader'
+
+    def _determine_architecture(self, db_instance: Dict, all_instances: List[Dict] = None) -> str:
+        """优化的架构判断 - 仅通过API，正确识别TAZ和主从关系"""
+        
+        # 1. 检查实例级Read Replica
         if db_instance.get('ReadReplicaSourceDBInstanceIdentifier'):
-            return 'read_replica'
-        elif db_instance.get('MultiAZ', False):
-            return 'MAZ'
-        else:
-            return 'Non-MAZ'
+            return 'read_replica_maz' if db_instance.get('MultiAZ', False) else 'read_replica'
+        
+        # 2. 检查集群级Read Replica
+        if db_instance.get('ReadReplicaSourceDBClusterIdentifier'):
+            return 'read_replica_maz' if db_instance.get('MultiAZ', False) else 'read_replica'
+        
+        # 3. 集群架构判断
+        cluster_id = db_instance.get('DBClusterIdentifier')
+        if cluster_id and all_instances:
+            try:
+                response = self.rds_client.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                cluster = response['DBClusters'][0]
+                members = cluster.get('DBClusterMembers', [])
+                
+                # TAZ: 3成员 + 1Writer/2Reader + 跨3AZ
+                if (len(members) == 3 and 
+                    len([m for m in members if m.get('IsClusterWriter')]) == 1 and
+                    self._is_cross_three_az(members, all_instances)):
+                    return 'taz_cluster'
+                    
+                return 'multi_az' if cluster.get('MultiAZ') else 'single_az'
+            except Exception as e:
+                print(f"获取集群信息失败: {e}")
+        
+        # 4. 实例级MultiAZ
+        return 'multi_az' if db_instance.get('MultiAZ') else 'single_az'
+
+    def _is_cross_three_az(self, members: List[Dict], all_instances: List[Dict]) -> bool:
+        """检查集群是否跨3个不同的可用区"""
+        azs = set()
+        for member in members:
+            for instance in all_instances:
+                if instance['DBInstanceIdentifier'] == member['DBInstanceIdentifier']:
+                    if az := instance.get('AvailabilityZone'):
+                        azs.add(az)
+                    break
+        return len(azs) == 3
 
     def get_all_ri_pricing(self) -> Dict[str, float]:
         """获取该region下所有MySQL实例类型的1年RI无预付价格"""
@@ -329,8 +537,19 @@ class RDSPricingAnalyzer:
             
             ri_hourly_rate = ri_pricing_cache.get(instance['instance_class'], 0.0)
             
-            # Multi-AZ实例RI费用乘以2
-            multiplier = 2 if instance['architecture'] == 'MAZ' else 1
+            # 确定最终架构类型和multiplier
+            final_architecture = instance['architecture']
+            multiplier = 1
+            
+            # 根据架构调整价格
+            architecture = instance['architecture']
+            if architecture in ['taz_cluster_writer', 'taz_cluster_reader']:
+                multiplier = 1  # TAZ集群中每个实例单独计算
+            elif architecture in ['multi_az', 'read_replica_maz']:
+                multiplier = 2  # Multi-AZ实例乘以2
+            else:
+                multiplier = 1  # Single-AZ或Read Replica实例
+            
             adjusted_ri_hourly_rate = ri_hourly_rate * multiplier
             ri_mrr = self.calculate_mrr(adjusted_ri_hourly_rate)
             
@@ -375,10 +594,13 @@ class RDSPricingAnalyzer:
                 'account_id': instance['account_id'],
                 'region': instance['region'],
                 'db_instance_identifier': instance['db_instance_identifier'],
+                'source_db_instance_identifier': instance['source_db_instance_identifier'],
                 'mysql_engine_version': instance['engine_version'],
-                'architecture': instance['architecture'],
+                'architecture': final_architecture,
                 'instance_class': instance['instance_class'],
+                'instance_status': instance.get('instance_status', ''),
                 'cpu_cores': instance['cpu_cores'],
+                'multiplier': multiplier,
                 '1yr_ri_noupfront_hourly_rate_usd': round(adjusted_ri_hourly_rate, 4),
                 '1yr_ri_noupfront_mrr_usd': ri_mrr,
                 'extended_support_year1_per_core_hourly_usd': extended_support_pricing['year1_per_core_per_hour'],
@@ -403,8 +625,8 @@ class RDSPricingAnalyzer:
     def _export_to_csv(self, results: List[Dict], output_file: str):
         """导出结果到CSV文件"""
         fieldnames = [
-            'account_id', 'region', 'db_instance_identifier', 'mysql_engine_version', 
-            'architecture', 'instance_class', 'cpu_cores',
+            'account_id', 'region', 'db_instance_identifier', 'source_db_instance_identifier', 'mysql_engine_version', 
+            'architecture', 'instance_class', 'instance_status', 'cpu_cores', 'multiplier',
             '1yr_ri_noupfront_hourly_rate_usd', '1yr_ri_noupfront_mrr_usd',
             'extended_support_year1_per_core_hourly_usd', 'extended_support_year1_mrr_usd',
             '1yr_extend_support vs. 1yr_ri_noupfront',
@@ -435,3 +657,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
