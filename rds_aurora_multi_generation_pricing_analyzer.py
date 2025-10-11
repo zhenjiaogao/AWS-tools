@@ -30,6 +30,8 @@ Aurora存储容量优化：
 
 提升执行效率：
 在脚本中实现了并发获取 cloudwatch 信息等，使用 --optimize 启用并发处理，-b -w 指定 batch size 以及并发数
+
+增加区域兼容性验证，该脚本仅支持在 global region 执行
 """
 
 import argparse
@@ -44,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import pandas as pd
+import requests
 
 
 class CompleteUnifiedRDSAuroraAnalyzer:
@@ -55,6 +58,15 @@ class CompleteUnifiedRDSAuroraAnalyzer:
         self.enable_optimization = enable_optimization
         self.max_workers = max_workers if enable_optimization else 1
         self.batch_size = batch_size
+        
+        # 设置基础日志（用于兼容性检查）
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        # 区域兼容性检查
+        if not self._check_region_compatibility():
+            print("\n❌ 脚本因区域兼容性问题终止执行")
+            sys.exit(1)
         
         # AWS客户端
         self.rds_client = boto3.client('rds', region_name=region)
@@ -132,6 +144,98 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             "sa-east-1": "South America (Sao Paulo)"
         }
         return region_mapping.get(self.region, self.region)
+
+    def _get_current_ec2_region(self):
+        """获取当前EC2实例所在的区域"""
+        try:
+            # 尝试IMDSv2
+            token_response = requests.put(
+                'http://169.254.169.254/latest/api/token',
+                headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'},
+                timeout=2
+            )
+            if token_response.status_code == 200:
+                token = token_response.text
+                region_response = requests.get(
+                    'http://169.254.169.254/latest/meta-data/placement/region',
+                    headers={'X-aws-ec2-metadata-token': token},
+                    timeout=2
+                )
+                if region_response.status_code == 200:
+                    return region_response.text.strip()
+        except:
+            pass
+        
+        try:
+            # 尝试IMDSv1
+            response = requests.get(
+                'http://169.254.169.254/latest/meta-data/placement/region',
+                timeout=2
+            )
+            if response.status_code == 200:
+                return response.text.strip()
+        except:
+            pass
+        
+        try:
+            session = boto3.Session()
+            return session.region_name
+        except:
+            pass
+            
+        # 尝试通过STS推断区域
+        try:
+            sts_client = boto3.client('sts')
+            identity = sts_client.get_caller_identity()
+            arn = identity.get('Arn', '')
+            if ':cn-' in arn:
+                return 'cn-north-1'  # 默认中国区域
+            else:
+                return 'us-east-1'  # 默认全球区域
+        except:
+            return None
+
+    def _is_china_region(self, region):
+        """判断是否为中国区域"""
+        return region.startswith('cn-') if region else False
+
+    def _check_region_compatibility(self):
+        """检查区域兼容性"""
+        current_region = self._get_current_ec2_region()
+        
+        if not current_region:
+            print("⚠️  警告: 无法确定当前EC2实例所在区域，跳过兼容性检查")
+            return True
+        
+        current_is_china = self._is_china_region(current_region)
+        target_is_china = self._is_china_region(self.region)
+        
+        # 当前EC2在中国区域时，直接提示不支持
+        if current_is_china:
+            print(f"""
+❌ 不支持的运行环境！
+
+当前EC2实例位于: {current_region} (中国区域)
+此脚本不支持在中国区域运行。
+""")
+            return False
+        
+        # 当前EC2在全球区域，但目标是中国区域时的提示
+        elif not current_is_china and target_is_china:
+            print(f"""
+❌ 区域兼容性错误！
+
+当前EC2实例位于: {current_region} (全球区域)
+目标评估区域: {self.region} (中国区域)
+
+⚠️  在全球区域的EC2实例上无法评估中国区域的RDS实例！
+请在中国区域的EC2实例上运行此脚本来分析中国区域的RDS实例。
+""")
+            return False
+        
+        # 全球区域到全球区域
+        print(f"✅ 区域兼容性检查通过: {current_region} -> {self.region} (全球分区)")
+        return True
 
     def _should_process_instance(self, instance_class: str) -> bool:
         """判断是否应该处理该实例类型"""
@@ -316,7 +420,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
                     attributes = product.get('product', {}).get('attributes', {})
                     instance_type = attributes.get('instanceType')
                     
-                    if not instance_type or not self._should_process_instance(instance_type):
+                    if not instance_type or not instance_type.startswith('db.'):
                         continue
                     
                     terms = product.get('terms', {})
@@ -343,6 +447,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             
         except Exception as e:
             self.logger.error(f"获取RDS MySQL定价失败: {e}")
+            self.logger.warning("RDS MySQL定价缓存为空，可能影响分析结果")
 
     def get_all_aurora_mysql_pricing(self) -> None:
         """获取所有Aurora MySQL定价"""
@@ -369,7 +474,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
                     attributes = product.get('product', {}).get('attributes', {})
                     instance_type = attributes.get('instanceType')
                     
-                    if not instance_type:
+                    if not instance_type or not instance_type.startswith('db.'):
                         continue
                     
                     terms = product.get('terms', {})
@@ -668,12 +773,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             
         except Exception as e:
             self.logger.error(f"获取Aurora存储定价失败: {e}")
-            # 返回默认值
-            self.aurora_storage_pricing_cache = {
-                'storage_gb_month': 0.1,
-                'io_million_requests': 0.2
-            }
-            return self.aurora_storage_pricing_cache
+            raise Exception(f"无法获取Aurora存储定价，请检查网络连接和AWS凭证: {e}")
     def get_all_rds_mysql_instances(self) -> List[Dict]:
         """获取所有RDS MySQL实例"""
         if self.enable_optimization:
