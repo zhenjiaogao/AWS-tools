@@ -24,14 +24,17 @@ RDS MySQL集群支持：
 Aurora存储容量优化：
 1. aurora_allocate_storage_gb 基于 Primary节点的 used_storage_gb（实际使用量）计算
 2. 符合Aurora共享存储特性，不累加集群中所有节点的存储量
-3. 更准确反映迁移到Aurora后的实际存储需求和成本
+3. 更准确反映迁移到Aurora后的实际存储需求和成本，通过 API 获取 standard 价格
 4. 优先使用Primary节点的实际使用量，如果未获取到则回退到分配量
 5. 避免基于过度分配或重复计算的存储容量进行成本计算
 
 提升执行效率：
-在脚本中实现了并发获取 cloudwatch 信息等，使用 --optimize 启用并发处理，-b -w 指定 batch size 以及并发数
+1. 在脚本中实现了并发获取 cloudwatch 信息等，使用 --optimize 启用并发处理，-b -w 指定 batch size 以及并发数
+2. 将 RDS 和 Aurora 的 Pricing 的获取，统一使用一个方法
 
-增加区域兼容性验证，该脚本仅支持在 global region 执行
+增加区域兼容性验证：该脚本仅支持在 global region 执行
+
+
 """
 
 import argparse
@@ -394,113 +397,75 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             self.logger.warning(f"获取CloudWatch指标失败: {e}")
         
         return metrics
-    def get_all_rds_mysql_pricing(self) -> None:
-        """获取所有RDS MySQL定价"""
-        if self.pricing_cache:
-            self.logger.info("RDS MySQL定价缓存已存在，跳过重复获取")
+    def get_all_mysql_pricing(self) -> None:
+        """一次性获取RDS MySQL和Aurora MySQL定价"""
+        if self.pricing_cache and self.aurora_pricing_cache:
+            self.logger.info("MySQL定价缓存已存在，跳过重复获取")
             return
         
         try:
-            self.logger.info(f"开始一次性获取区域 {self.region} 的所有RDS MySQL实例定价...")
+            self.logger.info(f"开始一次性获取区域 {self.region} 的所有MySQL实例定价...")
             
-            filters = [
-                {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
-                {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'MySQL'},
-                {'Type': 'TERM_MATCH', 'Field': 'deploymentOption', 'Value': 'Single-AZ'},
-                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
-            ]
+            # 分别获取两种引擎，但在一个方法中处理
+            engines = ['MySQL', 'Aurora MySQL']
+            rds_count = aurora_count = 0
             
-            paginator = self.pricing_client.get_paginator('get_products')
-            page_iterator = paginator.paginate(ServiceCode='AmazonRDS', Filters=filters)
+            for engine in engines:
+                filters = [
+                    {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
+                    {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': engine},
+                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
+                ]
+                
+                if engine == 'MySQL':
+                    filters.append({'Type': 'TERM_MATCH', 'Field': 'deploymentOption', 'Value': 'Single-AZ'})
+                
+                paginator = self.pricing_client.get_paginator('get_products')
+                page_iterator = paginator.paginate(ServiceCode='AmazonRDS', Filters=filters)
+                for page in page_iterator:
+                    for price_item in page['PriceList']:
+                        product = json.loads(price_item)
+                        attributes = product.get('product', {}).get('attributes', {})
+                        instance_type = attributes.get('instanceType')
+                        
+                        if not instance_type or not instance_type.startswith('db.'):
+                            continue
+                        
+                        terms = product.get('terms', {})
+                        reserved_terms = terms.get('Reserved', {})
+                        
+                        for term_key, term_data in reserved_terms.items():
+                            term_attributes = term_data.get('termAttributes', {})
+                            if (term_attributes.get('LeaseContractLength') == '1yr' and 
+                                term_attributes.get('PurchaseOption') == 'No Upfront'):
+                                
+                                price_dimensions = term_data.get('priceDimensions', {})
+                                for price_key, price_data in price_dimensions.items():
+                                    description = price_data.get('description', '')
+                                    
+                                    # Aurora MySQL: 跳过IO-optimized
+                                    if engine == 'Aurora MySQL' and 'IO-optimized' in description:
+                                        continue
+                                    
+                                    price_per_unit = price_data.get('pricePerUnit', {})
+                                    usd_price = price_per_unit.get('USD')
+                                    if usd_price:
+                                        hourly_rate = float(usd_price)
+                                        if engine == 'MySQL':
+                                            self.pricing_cache[instance_type] = hourly_rate
+                                            rds_count += 1
+                                        else:
+                                            self.aurora_pricing_cache[instance_type] = hourly_rate
+                                            aurora_count += 1
+                                        break
+                                break
             
-            processed_count = 0
-            for page in page_iterator:
-                for price_item in page['PriceList']:
-                    product = json.loads(price_item)
-                    attributes = product.get('product', {}).get('attributes', {})
-                    instance_type = attributes.get('instanceType')
-                    
-                    if not instance_type or not instance_type.startswith('db.'):
-                        continue
-                    
-                    terms = product.get('terms', {})
-                    reserved_terms = terms.get('Reserved', {})
-                    
-                    for term_key, term_data in reserved_terms.items():
-                        term_attributes = term_data.get('termAttributes', {})
-                        if (term_attributes.get('LeaseContractLength') == '1yr' and 
-                            term_attributes.get('PurchaseOption') == 'No Upfront'):
-                            
-                            price_dimensions = term_data.get('priceDimensions', {})
-                            for price_key, price_data in price_dimensions.items():
-                                price_per_unit = price_data.get('pricePerUnit', {})
-                                usd_price = price_per_unit.get('USD')
-                                if usd_price:
-                                    hourly_rate = float(usd_price)
-                                    self.pricing_cache[instance_type] = hourly_rate
-                                    processed_count += 1
-                                    self.logger.debug(f"缓存RDS MySQL定价: {instance_type} = ${hourly_rate}/小时")
-                                    break
-                            break
-            
-            self.logger.info(f"RDS MySQL定价缓存完成，共缓存 {processed_count} 个实例类型的定价信息")
-            
-        except Exception as e:
-            self.logger.error(f"获取RDS MySQL定价失败: {e}")
-            self.logger.warning("RDS MySQL定价缓存为空，可能影响分析结果")
-
-    def get_all_aurora_mysql_pricing(self) -> None:
-        """获取所有Aurora MySQL定价"""
-        if self.aurora_pricing_cache:
-            self.logger.info("Aurora MySQL定价缓存已存在，跳过重复获取")
-            return
-        
-        try:
-            self.logger.info(f"开始一次性获取区域 {self.region} 的所有Aurora MySQL实例定价...")
-            
-            filters = [
-                {'Type': 'TERM_MATCH', 'Field': 'servicecode', 'Value': 'AmazonRDS'},
-                {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': 'Aurora MySQL'},
-                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._get_pricing_location()}
-            ]
-            
-            paginator = self.pricing_client.get_paginator('get_products')
-            page_iterator = paginator.paginate(ServiceCode='AmazonRDS', Filters=filters)
-            
-            processed_count = 0
-            for page in page_iterator:
-                for price_item in page['PriceList']:
-                    product = json.loads(price_item)
-                    attributes = product.get('product', {}).get('attributes', {})
-                    instance_type = attributes.get('instanceType')
-                    
-                    if not instance_type or not instance_type.startswith('db.'):
-                        continue
-                    
-                    terms = product.get('terms', {})
-                    reserved_terms = terms.get('Reserved', {})
-                    
-                    for term_key, term_data in reserved_terms.items():
-                        term_attributes = term_data.get('termAttributes', {})
-                        if (term_attributes.get('LeaseContractLength') == '1yr' and 
-                            term_attributes.get('PurchaseOption') == 'No Upfront'):
-                            
-                            price_dimensions = term_data.get('priceDimensions', {})
-                            for price_key, price_data in price_dimensions.items():
-                                price_per_unit = price_data.get('pricePerUnit', {})
-                                usd_price = price_per_unit.get('USD')
-                                if usd_price:
-                                    hourly_rate = float(usd_price)
-                                    self.aurora_pricing_cache[instance_type] = hourly_rate
-                                    processed_count += 1
-                                    self.logger.debug(f"缓存Aurora MySQL定价: {instance_type} = ${hourly_rate}/小时")
-                                    break
-                            break
-            
-            self.logger.info(f"Aurora MySQL定价缓存完成，共缓存 {processed_count} 个实例类型的定价信息")
+            self.logger.info(f"RDS MySQL定价缓存完成，共缓存 {rds_count} 个实例类型的定价信息")
+            self.logger.info(f"Aurora MySQL定价缓存完成，共缓存 {aurora_count} 个实例类型的定价信息")
             
         except Exception as e:
-            self.logger.error(f"获取Aurora MySQL定价失败: {e}")
+            self.logger.error(f"获取MySQL定价失败: {e}")
+            self.logger.warning("MySQL定价缓存可能不完整，可能影响分析结果")
 
     def get_all_storage_pricing(self) -> None:
         """获取所有存储类型定价（采用原始脚本的可靠方法）"""
@@ -807,7 +772,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             for page in paginator.paginate():
                 for db_instance in page['DBInstances']:
                     if (db_instance.get('Engine') == 'mysql' and
-                        db_instance.get('DBInstanceStatus') == 'available' and
+                        db_instance.get('DBInstanceStatus') in ['available', 'storage-optimization', 'modifying'] and
                         db_instance.get('EngineVersion', '').startswith('8.0') and
                         self._should_process_instance(db_instance['DBInstanceClass'])):
                         all_db_instances.append(db_instance)
@@ -849,7 +814,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
             for page in paginator.paginate():
                 for db_instance in page['DBInstances']:
                     if (db_instance.get('Engine') == 'mysql' and
-                        db_instance.get('DBInstanceStatus') == 'available' and
+                        db_instance.get('DBInstanceStatus') in ['available', 'storage-optimization', 'modifying'] and
                         db_instance.get('EngineVersion', '').startswith('8.0') and
                         self._should_process_instance(db_instance['DBInstanceClass'])):
                         all_instances.append(db_instance)
@@ -1043,8 +1008,7 @@ class CompleteUnifiedRDSAuroraAnalyzer:
         self.logger.info(f"开始分析 - 模式: {'优化' if self.enable_optimization else '标准'}")
         
         # 获取所有定价信息
-        self.get_all_rds_mysql_pricing()
-        self.get_all_aurora_mysql_pricing()
+        self.get_all_mysql_pricing()
         self.get_all_storage_pricing()
         self.get_aurora_storage_pricing()
         
