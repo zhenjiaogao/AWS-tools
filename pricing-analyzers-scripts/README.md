@@ -1,6 +1,6 @@
 # RDS/Aurora 成本分析工具集
 
-面向 AWS SA 和客户的一键式成本分析工具，帮助评估 RDS/Aurora 的迁移、换代和 Extended Support 成本。
+面向 SA 和客户的一键式成本分析工具，帮助评估 RDS/Aurora 的迁移、换代和 Extended Support 成本。
 
 ---
 
